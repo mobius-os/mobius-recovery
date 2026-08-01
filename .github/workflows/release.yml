@@ -97,37 +97,50 @@ jobs:
             sleep "$attempt"
           done
           test "$observed" = "$IMAGE_DIGEST"
-      - name: Confirm this is still the current main release
+      - name: Classify this main release attempt
         id: current
         if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
         run: |
           git fetch --no-tags origin main
           if [ "$(git rev-parse origin/main)" != "$GITHUB_SHA" ]; then
-            echo "Main advanced; this older image will not be released"
-            echo "eligible=false" >> "$GITHUB_OUTPUT"
-            exit 0
+            echo "Main advanced; only an already-durable exact release may resume"
+            echo "require_existing=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "require_existing=false" >> "$GITHUB_OUTPUT"
           fi
-          echo "eligible=true" >> "$GITHUB_OUTPUT"
       - name: Advance durable mobius.you recovery release
         id: durable
-        if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main' && steps.current.outputs.eligible == 'true'
+        if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
         env:
           MOBIUS_YOU_RELEASE_URL: ${{ secrets.MOBIUS_YOU_RELEASE_URL }}
           MOBIUS_YOU_RELEASE_TOKEN: ${{ secrets.MOBIUS_YOU_RELEASE_TOKEN }}
           IMAGE_DIGEST: ${{ steps.publish.outputs.image_digest }}
           RELEASE_SEQUENCE: ${{ steps.publish.outputs.release_sequence }}
+          REQUIRE_EXISTING: ${{ steps.current.outputs.require_existing }}
         run: |
           if [ -z "${MOBIUS_YOU_RELEASE_URL:-}" ] || \
              [ -z "${MOBIUS_YOU_RELEASE_TOKEN:-}" ]; then
             echo "mobius.you release webhook credentials are required for main releases" >&2
             exit 1
           fi
-          payload=$(printf \
-            '{"build_sha":"%s","image_digest":"%s","release_sequence":%s}' \
-            "$GITHUB_SHA" "$IMAGE_DIGEST" "$RELEASE_SEQUENCE")
           response="$RUNNER_TEMP/recovery-release-response.json"
           release_wait_deadline=$(($(date -u +%s) + 7200))
+          require_existing="$REQUIRE_EXISTING"
           while true; do
+            git fetch --no-tags origin main
+            if [ "$(git rev-parse origin/main)" != "$GITHUB_SHA" ]; then
+              require_existing=true
+            fi
+            if [ "$require_existing" = true ]; then
+              payload=$(printf \
+                '{"build_sha":"%s","image_digest":"%s","release_sequence":%s,"require_existing":true}' \
+                "$GITHUB_SHA" "$IMAGE_DIGEST" "$RELEASE_SEQUENCE")
+            else
+              payload=$(printf \
+                '{"build_sha":"%s","image_digest":"%s","release_sequence":%s}' \
+                "$GITHUB_SHA" "$IMAGE_DIGEST" "$RELEASE_SEQUENCE")
+            fi
+            response_error=""
             status=$(curl --silent --show-error --retry 3 --retry-all-errors \
               --connect-timeout 10 --max-time 45 \
               --output "$response" \
@@ -138,7 +151,7 @@ jobs:
               --data "$payload" \
               "${MOBIUS_YOU_RELEASE_URL%/}/internal/recovery/releases/publish")
             case "$status" in
-              200|202) break ;;
+              202) break ;;
               409)
                 response_error=$(python3 - "$response" <<'PY'
           import json
@@ -149,7 +162,10 @@ jobs:
                   body = json.load(source)
           except (OSError, ValueError):
               body = {}
-          print(body.get("error", ""))
+          error = body.get("error", "")
+          if isinstance(error, dict):
+              error = error.get("code", "")
+          print(error if isinstance(error, str) else "")
           PY
           )
                 if [ "$response_error" = "recovery_release_fenced" ] && \
@@ -158,23 +174,37 @@ jobs:
                   sleep 15
                   continue
                 fi
+                if [ "$response_error" = "release_not_current" ] && \
+                   [ "$require_existing" = true ]; then
+                  echo "This stale attempt was never durably accepted; leaving stable untouched"
+                  echo "accepted=false" >> "$GITHUB_OUTPUT"
+                  echo "skipped=true" >> "$GITHUB_OUTPUT"
+                  exit 0
+                fi
                 ;;
             esac
             echo "mobius.you release webhook returned HTTP $status (${response_error:-unknown_error})" >&2
             exit 1
           done
+          contract_fields="$RUNNER_TEMP/recovery-release-contract.txt"
+          python3 scripts/release_contract.py acceptance \
+            --response "$response" \
+            --base-url "$MOBIUS_YOU_RELEASE_URL" \
+            --sequence "$RELEASE_SEQUENCE" \
+            --build-sha "$GITHUB_SHA" \
+            --image-digest "$IMAGE_DIGEST" > "$contract_fields"
+          readarray -t fields < "$contract_fields"
+          test "${#fields[@]}" -eq 2
+          echo "job_id=${fields[0]}" >> "$GITHUB_OUTPUT"
+          echo "status_url=${fields[1]}" >> "$GITHUB_OUTPUT"
           echo "approved=true" >> "$GITHUB_OUTPUT"
+          echo "accepted=true" >> "$GITHUB_OUTPUT"
+          echo "skipped=false" >> "$GITHUB_OUTPUT"
       - name: Promote durably approved main image to stable
         id: promote
         if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main' && steps.durable.outputs.approved == 'true'
         run: |
           image="ghcr.io/mobius-os/mobius-recovery"
-          git fetch --no-tags origin main
-          if [ "$(git rev-parse origin/main)" != "$GITHUB_SHA" ]; then
-            echo "Main advanced during release approval; stable remains untouched"
-            echo "promoted=false" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
           docker tag mobius-recovery:verified "$image:stable"
           docker push "$image:stable"
           anonymous_config="$RUNNER_TEMP/anonymous-docker-stable"
@@ -192,3 +222,49 @@ jobs:
           done
           test "$observed" = "$expected"
           echo "promoted=true" >> "$GITHUB_OUTPUT"
+      - name: Wait for durable managed reconciliation
+        id: reconcile
+        if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main' && steps.durable.outputs.approved == 'true'
+        env:
+          MOBIUS_YOU_RELEASE_TOKEN: ${{ secrets.MOBIUS_YOU_RELEASE_TOKEN }}
+          JOB_ID: ${{ steps.durable.outputs.job_id }}
+          STATUS_URL: ${{ steps.durable.outputs.status_url }}
+          RELEASE_SEQUENCE: ${{ steps.publish.outputs.release_sequence }}
+        run: |
+          response="$RUNNER_TEMP/recovery-release-job.json"
+          contract_result="$RUNNER_TEMP/recovery-release-job-contract.txt"
+          job_wait_deadline=$(($(date -u +%s) + 2700))
+          while true; do
+            status=$(curl --silent --show-error --retry 3 --retry-all-errors \
+              --connect-timeout 10 --max-time 45 \
+              --output "$response" \
+              --write-out '%{http_code}' \
+              --header "Authorization: Bearer $MOBIUS_YOU_RELEASE_TOKEN" \
+              "$STATUS_URL")
+            if [ "$status" != 200 ]; then
+              echo "mobius.you release job returned HTTP $status" >&2
+              exit 1
+            fi
+            python3 scripts/release_contract.py status \
+              --response "$response" \
+              --job-id "$JOB_ID" \
+              --sequence "$RELEASE_SEQUENCE" > "$contract_result"
+            result=$(tr -d '\n' < "$contract_result")
+            case "$result" in
+              success)
+                echo "ready=true" >> "$GITHUB_OUTPUT"
+                break
+                ;;
+              pending)
+                if [ "$(date -u +%s)" -ge "$job_wait_deadline" ]; then
+                  echo "mobius.you release reconciliation timed out" >&2
+                  exit 1
+                fi
+                sleep 15
+                ;;
+              *)
+                echo "release contract returned an unexpected result" >&2
+                exit 1
+                ;;
+            esac
+          done

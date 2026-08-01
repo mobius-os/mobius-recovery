@@ -240,13 +240,25 @@ copied into the runtime. CI tests the worker, builds one amd64 image, runs the
 container security probe, then publishes that exact image under the never-reused
 `sha-<commit>-run-<run>-attempt-<attempt>` tag. On `main`, the workflow first
 advances mobius.you's durable approved digest using a sequence derived from both
-run and attempt; only an accepted update may move `stable`. It checks `main` both
-before approval and immediately before promotion. A rerun therefore cannot
-overwrite an immutable artifact or let an older attempt move `stable`.
+run and attempt. The hook must return `202 accepted` with the exact sequence,
+SHA, digest, and a matching reconciliation job identity; only that response may
+move `stable`. CI rechecks `origin/main` before every hook attempt. Once the ref
+has advanced it sends `require_existing: true`, so a crash-restarted old run may
+resume an exact release that mobius.you already committed but cannot introduce
+an old release for the first time. `release_not_current` cleanly skips that stale
+attempt.
+
+After exact durable acceptance, CI always promotes that same digest to `stable`,
+even if `main` advances in the meantime. This keeps managed launches and
+self-hosted pulls on one release identity. It then polls the returned job URL
+with the release bearer. The run succeeds only when every item completed without
+failure, or every unfinished item is explicitly deferred by an active recovery;
+other terminal states and partial or failed counts fail the release. A rerun is
+therefore crash-safe across acceptance, stable promotion, and reconciliation.
 Mobius.you deploys the approved digest and checks its baked SHA before issuing a
 session. Recovery has no updater: a new release replaces its container from
-outside. Missing webhook credentials and exhausted webhook retries fail the
-release rather than leaving the control plane stale.
+outside. Missing webhook credentials, exhausted fence retries, and failed job
+polls fail the release rather than silently declaring it healthy.
 Before the webhook is called, CI performs an anonymous registry inspection of
 the exact immutable digest. It repeats that check against `stable` after
 promotion. The GHCR package must therefore be made **public before the first
