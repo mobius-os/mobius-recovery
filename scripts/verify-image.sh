@@ -38,6 +38,85 @@ docker run --rm --entrypoint /bin/sh "$image" -c '
   codex login --help >/dev/null
 '
 
+# Exercise the installed launcher, not a host checkout. The first session
+# leaves project memory behind; the workspace manager must delete it. The
+# second writable cwd deliberately shadows recovery_worker, and -I plus the
+# fixed /app import must still select the root-owned client with correct argv.
+docker run --rm --entrypoint python "$image" -c '
+import json
+import os
+import pathlib
+import socket
+import subprocess
+import sys
+import threading
+
+sys.path.insert(0, "/app")
+from recovery_worker.workspace import SessionWorkspaces
+
+spaces = SessionWorkspaces(pathlib.Path("/state/image-workspaces"))
+first = spaces.create()
+poison = first / "recovery_worker"
+poison.mkdir()
+(poison / "__init__.py").write_text("raise SystemExit(91)\n", encoding="utf-8")
+(poison / "target_client.py").write_text("raise SystemExit(92)\n", encoding="utf-8")
+(first / "CLAUDE.md").write_text("old-session-memory\n", encoding="utf-8")
+
+second = spaces.create()
+assert second != first
+assert not first.exists()
+poison = second / "recovery_worker"
+poison.mkdir()
+(poison / "__init__.py").write_text("raise SystemExit(93)\n", encoding="utf-8")
+(poison / "target_client.py").write_text("raise SystemExit(94)\n", encoding="utf-8")
+
+broker_path = pathlib.Path("/state/image-test-broker.sock")
+try:
+  broker_path.unlink()
+except FileNotFoundError:
+  pass
+listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+listener.bind(str(broker_path))
+listener.listen(1)
+
+def serve():
+  connection, _address = listener.accept()
+  with connection:
+    raw = b""
+    while not raw.endswith(b"\n"):
+      raw += connection.recv(4096)
+    request = json.loads(raw)
+    assert request == {"operation": "health", "args": {}}
+    connection.sendall(json.dumps({
+      "ok": True,
+      "result": {
+        "status": "ready",
+        "protocol": "mobius-recovery-target/v1",
+        "target": "mobius",
+        "mode": "recovery",
+      },
+    }).encode() + b"\n")
+  listener.close()
+
+server = threading.Thread(target=serve)
+server.start()
+environment = os.environ.copy()
+environment["MOBIUS_RECOVERY_BROKER_SOCKET"] = str(broker_path)
+result = subprocess.run(
+  ["/usr/local/bin/mobius-target", "health"],
+  cwd=second,
+  env=environment,
+  text=True,
+  capture_output=True,
+  timeout=10,
+)
+server.join(10)
+assert not server.is_alive()
+assert result.returncode == 0, (result.stdout, result.stderr)
+assert json.loads(result.stdout)["status"] == "ready"
+assert "SystemExit" not in result.stderr
+'
+
 docker run --rm --entrypoint python "$image" -c '
 import os
 paths = (

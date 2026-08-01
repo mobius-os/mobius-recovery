@@ -1,18 +1,16 @@
-# syntax=docker/dockerfile:1.7
-
-FROM node:24-trixie-slim AS provider-clis
+FROM node:24-trixie-slim@sha256:ac39e4b5fcb2b1b34b20364fd58b2e898f3bb80731ee6f62a7536f9df3d6aadc AS provider-clis
 
 ARG TARGETARCH=amd64
 RUN test "$TARGETARCH" = "amd64"
 
-RUN npm install -g --omit=dev \
-      @anthropic-ai/claude-code@2.1.218 \
-      @openai/codex@0.145.0 \
-    && claude --version \
-    && codex --version
+WORKDIR /provider-clis
+COPY package.json package-lock.json ./
+RUN npm ci --omit=dev --ignore-scripts --no-audit --no-fund \
+    && /provider-clis/node_modules/@anthropic-ai/claude-code-linux-x64/claude --version \
+    && /provider-clis/node_modules/@openai/codex-linux-x64/vendor/x86_64-unknown-linux-musl/bin/codex --version
 
 
-FROM python:3.12-slim-trixie
+FROM python:3.12-slim-trixie@sha256:57cd7c3a7a273101a6485ba99423ee568157882804b1124b4dd04266317710de
 
 ARG VCS_REF=development
 ARG VERSION=1.0.0
@@ -30,9 +28,11 @@ LABEL org.opencontainers.image.title="Mobius Recovery Worker" \
 # Claude ships as a standalone binary. Codex's native binary resolves its
 # bundled helper resources relative to this vendor directory, so neither npm
 # package wrapper nor Node belongs in the runtime image.
-COPY --from=provider-clis /usr/local/bin/claude /usr/local/bin/claude
 COPY --from=provider-clis \
-  /usr/local/lib/node_modules/@openai/codex/node_modules/@openai/codex-linux-x64/vendor/x86_64-unknown-linux-musl \
+  /provider-clis/node_modules/@anthropic-ai/claude-code-linux-x64/claude \
+  /usr/local/bin/claude
+COPY --from=provider-clis \
+  /provider-clis/node_modules/@openai/codex-linux-x64/vendor/x86_64-unknown-linux-musl \
   /opt/codex
 RUN ln -s /opt/codex/bin/codex /usr/local/bin/codex
 

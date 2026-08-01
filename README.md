@@ -16,9 +16,11 @@ target client. It deliberately contains none of the following:
 - the target bearer in a provider subprocess environment.
 
 The container runs as uid/gid `10001:10001`. `/app` and the target-client wrapper
-are root-owned and non-writable. Provider credentials, browser sessions, and chat
-history live only in process memory or `/state`; production mounts `/state` as an
-ephemeral volume/tmpfs and never as application data.
+are root-owned and non-writable. Every activation gets an unpredictable
+mode-`0700` workspace which is also the provider subprocess `HOME`; replacement,
+expiry, finish, and restart destroy it together with both providers' state.
+Browser sessions and chat history remain process-local. Production mounts
+`/state` as an ephemeral volume/tmpfs and never as application data.
 
 The Python worker must be container PID 1. Do not enable Docker/Compose `init`
 or place a same-uid process wrapper in front of it: such a wrapper would retain
@@ -31,7 +33,10 @@ container.
 The parent process owns the remote target bearer. Claude and Codex see only a
 mode-`0600` Unix socket beneath a mode-`0700` directory. The socket broker offers
 the five fixed target operations but no URL, token, instance, service, or host
-argument. `mobius-target` is the human-readable client for that broker.
+argument. `mobius-target` is the human-readable client for that broker. Its
+launcher uses Python isolated mode and inserts only the immutable `/app` import
+root, so a writable session cwd, `PYTHONPATH`, or old project memory cannot
+replace the target client.
 File reads and listings are lexically restricted to `/data`, `/app`, and `/tmp`;
 writes are restricted to `/data` and `/tmp`. The target independently enforces
 the same roots with beneath/no-magic-link filesystem resolution. Root repair
@@ -71,14 +76,27 @@ Content-Type: application/json
 ```
 
 The response supplies `session_id`, `target_url`, `target_token`,
-`session_capability`, and RFC3339 `expires_at`. All are ephemeral. Finishing
-starts an idempotent job with `POST /recovery/finish`, the session capability,
-and `{"session_id":"...","outcome":"recovered|cancelled"}`. A `202` response
-closes the broker and provider processes immediately. The worker retains only
-the finish capability and polls the authenticated `status_url`; reloading the
-page continues that poll without restoring target access. A successful result
-erases the session. `normal_boot_failed` may return one fresh target capability,
-which atomically resumes the same browser session.
+`target_token_sha256`, `session_capability`, and RFC3339 `expires_at`. All are
+ephemeral. Finishing starts generation `1` and posts the session capability with
+`{"session_id":"...","outcome":"recovered|cancelled","generation":1}`.
+Before that first blocking request, the worker claims a process-wide finish
+gate, stops the broker and provider processes, deletes their workspace/state,
+and clears its target bearer. Browser cancellation or a lost response cannot
+reopen that boundary. The worker retains only the finish capability and polls
+the authenticated `status_url`; reloading the page continues that poll without
+restoring target access. Every queued, running, failed, resumed, or finished
+result carries its exact generation.
+The browser also echoes the generation rendered into its page, so a delayed
+request from a pre-resume page can observe generation `2` but cannot start it.
+
+A successful result erases the session. Only `503 resumed` with
+`normal_boot_failed` may carry a fresh, preflight-bound target and
+`next_generation = generation + 1`. The worker installs both atomically before
+restarting the broker, clears the finish gate, and requires the next finish to
+use that new generation. Late responses from an older generation are discarded
+and their bearer is erased. Any other definitive rejection or terminal failure
+is represented as `failed` and remains fail-closed until the session expires or
+the owner opens a new Recovery launch.
 Mobius.you compares the baked build identity and its recorded deployed image
 digest with the latest durable release inside the same transaction that consumes
 the code, so an older process cannot win a launch-time release race.
@@ -88,9 +106,9 @@ Only after the parsed session is in the worker's in-memory store does it call
 authenticated `POST /recovery/exchange/ack`; ACK itself is idempotent and retried
 once on transport loss.
 
-If normal boot fails, mobius.you returns `503 normal_boot_failed` with a fresh
-target capability. The worker atomically swaps its broker back to that target and
-keeps the authenticated browser session open for continued repair.
+If normal boot fails again after further repair, the same generation transition
+can repeat; each attempt has a distinct idempotency generation and a newly
+preflighted capability.
 
 While the recovery page is visible, it sends a small authenticated heartbeat
 every 45 seconds so Railway Serverless does not suspend the process and erase its
@@ -118,9 +136,14 @@ Content-Type: application/json
 {"target_url":"http://<service>.railway.internal:18002","target_token":"..."}
 ```
 
-The worker accepts only an exact `http://*.railway.internal:18002` target,
-disables redirects and process proxy variables, requires the v1 target identity,
-and returns no target credential.
+The worker accepts only the canonical single-service form
+`http://*.railway.internal:18002` (no trailing path, credentials, query, or
+fragment), disables redirects and process proxy variables, requires the v1
+target identity, and returns no target credential. A successful probe records a
+short-lived one-use keyed binding of that exact URL and bearer. Exchange and
+resume responses must advertise the bearer SHA-256 and consume the matching
+binding; an unprobed URL, wrong bearer/hash, replay, or expired binding is
+rejected before a broker can start.
 
 ### Self-hosted
 
@@ -181,8 +204,11 @@ output is treated as hostile data in the recovery agent prompt.
 ```
 
 `build_sha` comes from a root-owned file created by the image build. Runtime env
-cannot spoof it. CI tests the worker, builds one amd64 image, runs the container
-security probe, then publishes that exact image under the never-reused
+cannot spoof it. Both base images, every GitHub Action, the full Python test
+closure, and the npm provider-CLI dependency graph are digest/integrity locked;
+the npm install scripts are disabled and only the verified native binaries are
+copied into the runtime. CI tests the worker, builds one amd64 image, runs the
+container security probe, then publishes that exact image under the never-reused
 `sha-<commit>-run-<run>-attempt-<attempt>` tag. On `main`, the workflow first
 advances mobius.you's durable approved digest using a sequence derived from both
 run and attempt; only an accepted update may move `stable`. It checks `main` both
@@ -204,9 +230,8 @@ publish immediately—there is no long-lived updater inside the worker.
 ```bash
 python -m venv .venv
 . .venv/bin/activate
-pip install --require-hashes -r requirements.lock
-pip install -r requirements-dev.txt
-pytest
+pip install --require-hashes -r requirements-dev.lock
+python -m pytest
 
 docker build \
   --build-arg VCS_REF="$(git rev-parse HEAD)" \
