@@ -32,6 +32,7 @@ jobs:
   image:
     needs: test
     runs-on: ubuntu-latest
+    timeout-minutes: 180
     permissions:
       contents: read
       packages: write
@@ -124,23 +125,44 @@ jobs:
           payload=$(printf \
             '{"build_sha":"%s","image_digest":"%s","release_sequence":%s}' \
             "$GITHUB_SHA" "$IMAGE_DIGEST" "$RELEASE_SEQUENCE")
-          status=$(curl --silent --show-error --retry 3 --retry-all-errors \
-            --connect-timeout 10 --max-time 45 \
-            --output /tmp/recovery-release-response.json \
-            --write-out '%{http_code}' \
-            --request POST \
-            --header "Authorization: Bearer $MOBIUS_YOU_RELEASE_TOKEN" \
-            --header 'Content-Type: application/json' \
-            --data "$payload" \
-            "${MOBIUS_YOU_RELEASE_URL%/}/internal/recovery/releases/publish")
-          case "$status" in
-            200|202) ;;
-            *)
-              echo "mobius.you release webhook returned HTTP $status" >&2
-              sed -n '1,20p' /tmp/recovery-release-response.json >&2
-              exit 1
-              ;;
-          esac
+          response="$RUNNER_TEMP/recovery-release-response.json"
+          release_wait_deadline=$(($(date -u +%s) + 7200))
+          while true; do
+            status=$(curl --silent --show-error --retry 3 --retry-all-errors \
+              --connect-timeout 10 --max-time 45 \
+              --output "$response" \
+              --write-out '%{http_code}' \
+              --request POST \
+              --header "Authorization: Bearer $MOBIUS_YOU_RELEASE_TOKEN" \
+              --header 'Content-Type: application/json' \
+              --data "$payload" \
+              "${MOBIUS_YOU_RELEASE_URL%/}/internal/recovery/releases/publish")
+            case "$status" in
+              200|202) break ;;
+              409)
+                response_error=$(python3 - "$response" <<'PY'
+          import json
+          import sys
+
+          try:
+              with open(sys.argv[1], encoding="utf-8") as source:
+                  body = json.load(source)
+          except (OSError, ValueError):
+              body = {}
+          print(body.get("error", ""))
+          PY
+          )
+                if [ "$response_error" = "recovery_release_fenced" ] && \
+                   [ "$(date -u +%s)" -lt "$release_wait_deadline" ]; then
+                  echo "mobius.you is completing a fenced recovery operation; retrying durable release approval"
+                  sleep 15
+                  continue
+                fi
+                ;;
+            esac
+            echo "mobius.you release webhook returned HTTP $status (${response_error:-unknown_error})" >&2
+            exit 1
+          done
           echo "approved=true" >> "$GITHUB_OUTPUT"
       - name: Promote durably approved main image to stable
         id: promote
