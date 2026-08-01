@@ -22,7 +22,9 @@ jobs:
         with:
           python-version: '3.12'
           cache: pip
-      - run: pip install --requirement requirements-dev.txt
+      - run: |
+          pip install --require-hashes --requirement requirements.lock
+          pip install --requirement requirements-dev.txt
       - run: pytest
 
   image:

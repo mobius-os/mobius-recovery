@@ -30,8 +30,9 @@ RUN ln -s /opt/codex/bin/codex /usr/local/bin/codex
 
 WORKDIR /app
 
-COPY requirements.txt /app/requirements.txt
-RUN pip install --no-cache-dir --requirement /app/requirements.txt \
+COPY requirements.lock /app/requirements.lock
+RUN pip install --no-cache-dir --require-hashes \
+      --requirement /app/requirements.lock \
     && groupadd --gid 10001 recovery \
     && useradd --uid 10001 --gid 10001 --home-dir /state \
       --no-create-home --shell /usr/sbin/nologin recovery \

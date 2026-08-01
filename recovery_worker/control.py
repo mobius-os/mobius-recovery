@@ -120,6 +120,10 @@ class ControlClient:
           "service_id": self._settings.service_id,
           "bootstrap_secret": self._settings.bootstrap_secret,
           "protocol_version": WORKER_PROTOCOL_VERSION,
+          # Baked identity closes the final launch-to-exchange race: the
+          # controller rejects an older process after a newer digest is
+          # approved, before it discloses the target capability.
+          "build_sha": self._settings.build_sha,
       },
     )
     if status >= 400:

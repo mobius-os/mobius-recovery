@@ -58,7 +58,8 @@ Content-Type: application/json
   "instance_id": "...",
   "service_id": "...",
   "bootstrap_secret": "...",
-  "protocol_version": "mobius-recovery-worker/v1"
+  "protocol_version": "mobius-recovery-worker/v1",
+  "build_sha": "<baked git commit>"
 }
 ```
 
@@ -66,6 +67,9 @@ The response supplies `session_id`, `target_url`, `target_token`,
 `session_capability`, and RFC3339 `expires_at`. All are ephemeral. Finishing calls
 only `POST /recovery/finish` with the session capability and
 `{"session_id":"...","outcome":"recovered|cancelled"}`.
+Mobius.you compares the baked build identity and its recorded deployed image
+digest with the latest durable release inside the same transaction that consumes
+the code, so an older process cannot win a launch-time release race.
 
 If normal boot fails, mobius.you returns `503 normal_boot_failed` with a fresh
 target capability. The worker atomically swaps its broker back to that target and
@@ -160,6 +164,7 @@ release rather than leaving the control plane stale.
 ```bash
 python -m venv .venv
 . .venv/bin/activate
+pip install --require-hashes -r requirements.lock
 pip install -r requirements-dev.txt
 pytest
 

@@ -227,6 +227,7 @@ def test_managed_exchange_body_and_code_replay() -> None:
     "service_id": "recovery-service",
     "bootstrap_secret": "bootstrap-" + "b" * 32,
     "protocol_version": "mobius-recovery-worker/v1",
+    "build_sha": "abc123",
   }]
   with pytest.raises(ProtocolError) as replay:
     store.start("managed-code", "instance-2")
