@@ -1,0 +1,7 @@
+#!/bin/sh
+exec /usr/local/bin/python3 -I -c '
+import sys
+sys.path.insert(0, "/app")
+from recovery_worker.target_client import cli
+raise SystemExit(cli())
+' "$@"
