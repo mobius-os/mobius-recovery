@@ -164,10 +164,16 @@ def recovery_page(
   build_sha: str,
   session_id: str,
   readiness_error: str | None = None,
+  finishing: bool = False,
+  finish_result=None,
 ) -> str:
   facts = {"protocol": protocol_version, "build": build_sha, "session": session_id}
-  dot_class = "dot pending" if readiness_error else "dot"
-  target_text = readiness_error or "Connected to one repair target"
+  finish_error = getattr(finish_result, "error_message", None)
+  dot_class = "dot pending" if readiness_error or finishing else "dot"
+  target_text = (
+    finish_error or "Finishing recovery…"
+    if finishing else readiness_error or "Connected to one repair target"
+  )
   body = f"""<main class="shell"><aside class="rail"><div class="brand"><div class="mark" aria-hidden="true">∞</div>
 <span>Mobius Recovery</span></div><div class="status-line"><span id="target-dot" class="{dot_class}"></span><span><strong>Isolated worker</strong><br>
 <span id="target-status">{html.escape(target_text)}</span></span></div><div class="facts">"""
@@ -193,15 +199,23 @@ def recovery_page(
 <dialog id="finish-dialog"><h2>Finish this recovery?</h2><p class="lede">Mobius will verify normal startup and close this temporary capability.</p>
 <div class="dialog-actions"><button class="button secondary" data-finish-close type="button">Keep working</button>
 <button class="button" data-finish-confirm type="button">Finish recovery</button></div></dialog>"""
-  return _document("Repair · Mobius Recovery", body, nonce, _SCRIPT)
+  script = _SCRIPT.replace(
+    "const initialFinishing=false;",
+    f"const initialFinishing={'true' if finishing else 'false'};",
+  )
+  return _document("Repair · Mobius Recovery", body, nonce, script)
 
 
 _SCRIPT = r"""
 history.replaceState(null,'','/');
 const $=s=>document.querySelector(s), messages=$('#messages'), empty=$('#empty');
-let busy=false;
-function setBusy(value){busy=value;$('#send').disabled=value;$('#message').disabled=value;$('#finish').disabled=value;$('#cancel').disabled=value;
+const initialFinishing=false;
+let busy=false,finishing=initialFinishing,finishTimer;
+function setBusy(value){busy=value;const disabled=value||finishing;$('#send').disabled=disabled;$('#message').disabled=disabled;$('#finish').disabled=disabled;$('#cancel').disabled=disabled;
  $('#finish').title=value?'Wait for the active recovery turn to finish.':'';$('#cancel').title=$('#finish').title}
+function enterFinishing(message='Finishing recovery…'){finishing=true;setBusy(true);$('#finish-dialog').close();
+ document.querySelectorAll('[data-connect],input[name=provider]').forEach(el=>el.disabled=true);$('#target-dot').className='dot pending';$('#target-status').textContent=message;
+ clearInterval(heartbeatTimer);clearTimeout(targetRetryTimer)}
 function addMessage(role,text){empty?.remove();const el=document.createElement('div');el.className='message '+role;
  const label=document.createElement('span');label.className='message-label';label.textContent=role==='user'?'YOU':'RECOVERY AGENT';
  const content=document.createElement('span');content.textContent=text;el.append(label,content);messages.append(el);el.scrollIntoView({block:'end'});return content}
@@ -238,11 +252,18 @@ $('#composer').addEventListener('submit',async e=>{e.preventDefault();if(busy)re
  else if(ev.type==='tool')addTool(ev.name);else if(ev.type==='error')addMessage('assistant','Error: '+ev.message)}}
  }catch(err){addMessage('assistant','Error: '+err.message)}finally{setBusy(false);input.focus()}});
 $('#finish').onclick=()=>$('#finish-dialog').showModal();$('[data-finish-close]').onclick=()=>$('#finish-dialog').close();
-async function finish(outcome){try{await api('/api/finish',{method:'POST',body:JSON.stringify({outcome})});location.replace('/')}catch(e){if(!redirectLost(e))alert(e.message)}}
+function handleFinish(data){if(data.status==='finished'){location.replace('/');return}if(data.status==='resumed'){location.reload();return}
+ if(data.status==='failed'||data.status==='resumed'){const message=data.error?.message||'Recovery could not be finished.';enterFinishing(message);return}
+ clearTimeout(finishTimer);finishTimer=setTimeout(pollFinish,1200)}
+async function pollFinish(){if(!finishing)return;try{handleFinish(await api('/api/finish/status'))}catch(e){if(redirectLost(e))return;
+ $('#target-status').textContent='Still waiting for finish status · '+e.message;finishTimer=setTimeout(pollFinish,1800)}}
+async function finish(outcome){enterFinishing();try{handleFinish(await api('/api/finish',{method:'POST',body:JSON.stringify({outcome})}))}
+ catch(e){if(redirectLost(e))return;if(e.status&&e.status<500){finishing=false;setBusy(false);alert(e.message)}else{
+ $('#target-status').textContent='Confirming finish status…';finishTimer=setTimeout(pollFinish,1200)}}}
 $('[data-finish-confirm]').onclick=()=>finish('recovered');$('#cancel').onclick=()=>{if(confirm('Cancel this recovery session?'))finish('cancelled')};
 let heartbeatTimer;
 async function heartbeat(){if(document.visibilityState!=='visible'||busy)return;try{await api('/api/turn')}catch(error){redirectLost(error)}}
 function heartbeatVisibility(){clearInterval(heartbeatTimer);clearTimeout(targetRetryTimer);if(document.visibilityState==='visible'){heartbeat();refreshTarget();heartbeatTimer=setInterval(heartbeat,45000)}}
 document.addEventListener('visibilitychange',heartbeatVisibility);window.addEventListener('pagehide',()=>{clearInterval(heartbeatTimer);clearTimeout(targetRetryTimer)});
-refreshProviders();heartbeatVisibility();
+if(initialFinishing){enterFinishing();pollFinish()}else{refreshProviders();heartbeatVisibility()}
 """

@@ -15,6 +15,8 @@ import time
 import urllib.error
 import urllib.request
 from base64 import urlsafe_b64encode
+from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path
 from urllib.parse import parse_qs, urlencode, urlparse
 
@@ -34,6 +36,84 @@ _SCOPES = (
   "org:create_api_key user:profile user:inference "
   "user:sessions:claude_code user:mcp_servers user:file_upload"
 )
+
+
+def _process_table() -> dict[int, tuple[int, str]]:
+  processes: dict[int, tuple[int, str]] = {}
+  try:
+    entries = os.scandir("/proc")
+  except OSError:
+    return processes
+  with entries:
+    for entry in entries:
+      if not entry.name.isdigit():
+        continue
+      try:
+        stat = Path(entry.path, "stat").read_text(encoding="ascii")
+        # comm may contain spaces and parentheses, so split after its final ')'.
+        fields = stat.rsplit(")", 1)[1].strip().split()
+        processes[int(entry.name)] = (int(fields[1]), fields[0])
+      except (OSError, ValueError, IndexError):
+        continue
+  return processes
+
+
+def descendant_pids(root_pid: int | None = None) -> set[int]:
+  """Returns the live transitive child set from a single /proc snapshot."""
+  root_pid = root_pid or os.getpid()
+  processes = _process_table()
+  descendants: set[int] = set()
+  changed = True
+  while changed:
+    changed = False
+    for pid, (parent, _state) in processes.items():
+      if pid == root_pid or pid in descendants:
+        continue
+      if parent == root_pid or parent in descendants:
+        descendants.add(pid)
+        changed = True
+  return descendants
+
+
+def _reap_zombie_children() -> None:
+  worker_pid = os.getpid()
+  for pid, (parent, state) in _process_table().items():
+    if parent != worker_pid or state != "Z":
+      continue
+    try:
+      os.waitpid(pid, os.WNOHANG)
+    except (ChildProcessError, ProcessLookupError):
+      pass
+
+
+def terminate_descendants(grace_seconds: float = 0.2) -> None:
+  """Terminates provider helpers, including setsid/double-fork descendants."""
+  descendants = descendant_pids()
+  for pid in descendants:
+    try:
+      os.kill(pid, signal.SIGTERM)
+    except (ProcessLookupError, PermissionError):
+      pass
+  deadline = time.monotonic() + max(0.0, grace_seconds)
+  while descendants and time.monotonic() < deadline:
+    descendants &= descendant_pids()
+    if descendants:
+      time.sleep(0.01)
+  # Repeat the snapshot after TERM: a dying parent can reparent a helper to the
+  # worker between scans, and the subreaper makes that helper visible here.
+  # Repeat after SIGKILL so a helper forked in the final parent-death race is
+  # observed after the subreaper adopts it.
+  for _round in range(5):
+    current = descendant_pids()
+    if not current:
+      break
+    for pid in current:
+      try:
+        os.kill(pid, signal.SIGKILL)
+      except (ProcessLookupError, PermissionError):
+        pass
+    time.sleep(0.01)
+    _reap_zombie_children()
 
 
 def subprocess_env() -> dict[str, str]:
@@ -58,21 +138,63 @@ class ProviderAuth:
     self._pkce_lock = threading.Lock()
     self._codex: dict = {"proc": None, "result": None, "output": ""}
     self._codex_lock = threading.Lock()
+    self._state_lock = threading.Lock()
+    self._state_changed = threading.Condition(self._state_lock)
+    self._enabled = True
+    self._generation = 0
+    self._launches = 0
+
+  def enable(self) -> int:
+    with self._state_lock:
+      self._generation += 1
+      self._enabled = True
+      return self._generation
+
+  def active_generation(self) -> int:
+    with self._state_lock:
+      if not self._enabled:
+        raise ProtocolError(
+          "auth_expired", "Recovery provider session is closed.", 401
+        )
+      return self._generation
+
+  @contextmanager
+  def launch_guard(self, generation: int) -> Iterator[None]:
+    """Serializes process creation against clear() and session replacement."""
+    with self._state_changed:
+      if not self._enabled or generation != self._generation:
+        raise ProtocolError(
+          "auth_expired", "Recovery provider session is closed.", 401
+        )
+      self._launches += 1
+    try:
+      yield
+    finally:
+      with self._state_changed:
+        self._launches -= 1
+        self._state_changed.notify_all()
 
   def status(self) -> dict[str, bool]:
+    with self._state_lock:
+      if not self._enabled:
+        return {"claude": False, "codex": False}
     return {
       "claude": (CLAUDE_DIR / ".credentials.json").is_file(),
       "codex": (CODEX_DIR / "auth.json").is_file(),
     }
 
   def claude_start(self) -> dict:
+    generation = self.active_generation()
     verifier = secrets.token_urlsafe(43)
     challenge = urlsafe_b64encode(
       hashlib.sha256(verifier.encode()).digest()
     ).rstrip(b"=").decode()
     state = secrets.token_urlsafe(32)
-    with self._pkce_lock:
-      self._pkce = {"verifier": verifier, "state": state, "ts": time.time()}
+    with self._state_lock:
+      if not self._enabled or generation != self._generation:
+        raise ProtocolError("auth_expired", "Recovery provider session is closed.", 401)
+      with self._pkce_lock:
+        self._pkce = {"verifier": verifier, "state": state, "ts": time.time()}
     query = urlencode({
       "code": "true",
       "client_id": _CLAUDE_CLIENT_ID,
@@ -100,6 +222,7 @@ class ProviderAuth:
     return code, (values.get("state") or [None])[0]
 
   def claude_exchange(self, raw_code: str) -> None:
+    generation = self.active_generation()
     if not raw_code or len(raw_code) > 8192:
       raise ProtocolError("invalid_code", "Authorization code is required.", 400)
     with self._pkce_lock:
@@ -167,10 +290,11 @@ class ProviderAuth:
         "email": (token_data.get("account") or {}).get("email_address", ""),
       }
     }
-    self._private_json(CLAUDE_DIR / ".credentials.json", credentials)
+    self._private_json(
+      CLAUDE_DIR / ".credentials.json", credentials, generation
+    )
 
-  @staticmethod
-  def _private_json(path: Path, value: dict) -> None:
+  def _private_json(self, path: Path, value: dict, generation: int) -> None:
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     path.parent.chmod(0o700)
     temp = path.with_name(f".{path.name}.{secrets.token_hex(8)}")
@@ -178,8 +302,13 @@ class ProviderAuth:
     try:
       with os.fdopen(fd, "w", encoding="utf-8") as handle:
         json.dump(value, handle)
-      os.replace(temp, path)
-      path.chmod(0o600)
+      with self._state_lock:
+        if not self._enabled or generation != self._generation:
+          raise ProtocolError(
+            "auth_expired", "Recovery provider session is closed.", 401
+          )
+        os.replace(temp, path)
+        path.chmod(0o600)
     finally:
       try:
         temp.unlink()
@@ -199,6 +328,7 @@ class ProviderAuth:
         pass
 
   def codex_start(self) -> dict:
+    generation = self.active_generation()
     with self._codex_lock:
       old = self._codex.get("proc")
     self._kill(old)
@@ -207,21 +337,26 @@ class ProviderAuth:
     env = subprocess_env()
     env["HOME"] = str(STATE_DIR)
     env["CODEX_HOME"] = str(CODEX_DIR)
-    try:
-      proc = subprocess.Popen(
-        ["codex", "login", "--device-auth"],
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        close_fds=True,
-        env=env,
-        text=True,
-        start_new_session=True,
-      )
-    except OSError as exc:
-      raise ProtocolError("provider_missing", "Codex CLI could not start.", 500) from exc
-    with self._codex_lock:
-      self._codex = {"proc": proc, "result": None, "output": ""}
+    with self._state_lock:
+      if not self._enabled or generation != self._generation:
+        raise ProtocolError("auth_expired", "Recovery provider session is closed.", 401)
+      try:
+        proc = subprocess.Popen(
+          ["codex", "login", "--device-auth"],
+          stdin=subprocess.DEVNULL,
+          stdout=subprocess.PIPE,
+          stderr=subprocess.STDOUT,
+          close_fds=True,
+          env=env,
+          text=True,
+          start_new_session=True,
+        )
+      except OSError as exc:
+        raise ProtocolError(
+          "provider_missing", "Codex CLI could not start.", 500
+        ) from exc
+      with self._codex_lock:
+        self._codex = {"proc": proc, "result": None, "output": ""}
 
     def reader() -> None:
       try:
@@ -253,6 +388,11 @@ class ProviderAuth:
       time.sleep(0.2)
     with self._codex_lock:
       parsed = parse_login_banner(self._codex["output"])
+    with self._state_lock:
+      active = self._enabled and generation == self._generation
+    if not active:
+      self._kill(proc)
+      raise ProtocolError("auth_expired", "Recovery provider session is closed.", 401)
     if parsed is None:
       self._kill(proc)
       raise ProtocolError("provider_invalid", "Could not read the Codex device code.", 500)
@@ -275,6 +415,16 @@ class ProviderAuth:
 
   def clear(self) -> None:
     """Destroys all ephemeral provider credentials and login state."""
+    with self._state_changed:
+      self._enabled = False
+      self._generation += 1
+      while self._launches:
+        self._state_changed.wait()
     self.terminate()
+    terminate_descendants()
+    with self._pkce_lock:
+      self._pkce = None
+    with self._codex_lock:
+      self._codex = {"proc": None, "result": None, "output": ""}
     for path in (CLAUDE_DIR, CODEX_DIR):
       shutil.rmtree(path, ignore_errors=True)

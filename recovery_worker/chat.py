@@ -12,8 +12,15 @@ import time
 from collections.abc import AsyncIterator
 
 from .config import STATE_DIR
-from .providers import CLAUDE_DIR, CODEX_DIR, subprocess_env
-from .sessions import Message, RecoverySession
+from .providers import (
+  CLAUDE_DIR,
+  CODEX_DIR,
+  ProviderAuth,
+  subprocess_env,
+  terminate_descendants,
+)
+from .protocol import ProtocolError
+from .sessions import RecoverySession
 
 
 MAX_MESSAGE_CHARS = 32_000
@@ -53,7 +60,7 @@ with the Finish Recovery button; you cannot deploy or modify this worker.
 def _history(session: RecoverySession) -> str:
   lines: list[str] = []
   total = 0
-  for message in reversed(session.messages[-40:]):
+  for message in reversed(session.history(40)):
     block = f"{message.role.upper()}:\n{message.content}\n"
     total += len(block)
     if total > 100_000:
@@ -159,6 +166,7 @@ async def _stderr(proc: asyncio.subprocess.Process) -> bytes:
 async def _spawn(
   provider: str,
   session: RecoverySession,
+  provider_auth: ProviderAuth,
 ) -> AsyncIterator[dict]:
   binary = shutil.which(provider)
   if not binary:
@@ -198,16 +206,32 @@ async def _spawn(
     ]
     stdin_payload = f"{SYSTEM_PROMPT}\n\n---\n\n{prompt}"
   try:
-    proc = await asyncio.create_subprocess_exec(
-      *command,
-      stdin=asyncio.subprocess.PIPE,
-      stdout=asyncio.subprocess.PIPE,
-      stderr=asyncio.subprocess.PIPE,
-      close_fds=True,
-      env=_environment(session, provider),
-      cwd=workspace,
-      start_new_session=True,
-    )
+    generation = session.provider_generation
+    if generation is None:
+      raise ProtocolError(
+        "auth_expired", "Recovery provider session is closed.", 401
+      )
+    # clear() takes this same guard before disabling the generation. If
+    # revocation wins, no child starts; if launch wins, cleanup observes and
+    # kills the registered descendant before it returns.
+    with provider_auth.launch_guard(generation):
+      if session.revoked or session.finishing:
+        raise ProtocolError(
+          "auth_expired", "Recovery provider session is closed.", 401
+        )
+      proc = await asyncio.create_subprocess_exec(
+        *command,
+        stdin=asyncio.subprocess.PIPE,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+        close_fds=True,
+        env=_environment(session, provider),
+        cwd=workspace,
+        start_new_session=True,
+      )
+  except ProtocolError as exc:
+    yield {"type": "error", "message": exc.message}
+    return
   except OSError:
     yield {"type": "error", "message": f"{provider} CLI could not start."}
     return
@@ -281,13 +305,14 @@ async def _spawn(
       stderr_task.cancel()
   text = "".join(assistant).strip()
   if text:
-    session.messages.append(Message(role="assistant", content=text))
+    session.add_message("assistant", text)
 
 
 async def stream_turn(
   message: str,
   provider: str,
   session: RecoverySession,
+  provider_auth: ProviderAuth,
 ) -> AsyncIterator[dict]:
   if provider not in {"claude", "codex"}:
     yield {"type": "error", "message": "Unsupported provider."}
@@ -301,14 +326,22 @@ async def stream_turn(
     yield {"type": "error", "message": "Another recovery turn is running."}
     yield {"type": "done"}
     return
-  session.messages.append(Message(role="user", content=message.strip()))
+  if session.revoked or session.finishing:
+    yield {"type": "error", "message": "Recovery session expired."}
+    yield {"type": "done"}
+    _release()
+    return
+  session.add_message("user", message.strip())
   try:
-    async for event in _spawn(provider, session):
+    async for event in _spawn(provider, session, provider_auth):
       yield event
   except asyncio.CancelledError:
     raise
   except Exception:
     yield {"type": "error", "message": "Recovery provider failed unexpectedly."}
   finally:
+    # A CLI can spawn a helper into a fresh process group and then exit. Do not
+    # leave that helper with access to the still-live session broker.
+    await asyncio.to_thread(terminate_descendants)
     _release()
   yield {"type": "done"}

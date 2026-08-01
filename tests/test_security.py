@@ -35,3 +35,17 @@ def test_no_new_privileges_failure_is_fatal(monkeypatch) -> None:
   monkeypatch.setattr(security.ctypes, "get_errno", lambda: 1)
   with pytest.raises(RuntimeError, match="PR_SET_NO_NEW_PRIVS hardening failed"):
     security.harden_process()
+
+
+def test_subreaper_failure_is_fatal(monkeypatch) -> None:
+  class Libc:
+    calls = 0
+
+    def prctl(self, *_args):
+      self.calls += 1
+      return 0 if self.calls < 3 else -1
+
+  monkeypatch.setattr(security.ctypes, "CDLL", lambda *_args, **_kwargs: Libc())
+  monkeypatch.setattr(security.ctypes, "get_errno", lambda: 1)
+  with pytest.raises(RuntimeError, match="PR_SET_CHILD_SUBREAPER hardening failed"):
+    security.harden_process()

@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import json
+import time
 from dataclasses import dataclass
 from datetime import datetime
+from urllib.parse import urlparse
 
 import httpx
 
@@ -13,6 +15,7 @@ from .protocol import ProtocolError, TargetCapability, parse_expiry
 
 
 MAX_CONTROL_RESPONSE_BYTES = 1024 * 1024
+CONTROL_RETRY_BACKOFF_SECONDS = 0.1
 
 
 @dataclass
@@ -22,25 +25,26 @@ class ExchangeResult:
   session_capability: str
   expires_at: datetime
 
+  def clear(self) -> None:
+    self.target.clear()
+    self.session_capability = ""
 
-class RecoveryResumed(ProtocolError):
-  """Normal boot failed and control returned a fresh repair capability."""
 
-  def __init__(
-    self,
-    *,
-    session_id: str,
-    target: TargetCapability,
-    expires_at: datetime,
-  ) -> None:
-    super().__init__(
-      "normal_boot_failed",
-      "Normal boot failed; recovery resumed with a fresh target.",
-      503,
-    )
-    self.session_id = session_id
-    self.target = target
-    self.expires_at = expires_at
+@dataclass
+class FinishResult:
+  finish_id: str
+  session_id: str
+  status: str
+  outcome: str
+  status_url: str
+  target: TargetCapability | None = None
+  expires_at: datetime | None = None
+  error_code: str | None = None
+  error_message: str | None = None
+
+  @property
+  def pending(self) -> bool:
+    return self.status in {"queued", "running"}
 
 
 class ControlClient:
@@ -67,42 +71,64 @@ class ControlClient:
   def close(self) -> None:
     self._client.close()
 
-  def _post_json(
+  def _request_json(
     self,
+    method: str,
     path: str,
-    body: dict,
+    body: dict | None,
     *,
     headers: dict[str, str] | None = None,
+    retry_transport_once: bool = False,
   ) -> tuple[int, dict]:
-    try:
-      with self._client.stream(
-        "POST", path, json=body, headers=headers
-      ) as response:
-        length = response.headers.get("content-length")
-        if length:
-          try:
-            if int(length) > MAX_CONTROL_RESPONSE_BYTES:
+    encoded = (
+      json.dumps(body, separators=(",", ":")).encode("utf-8")
+      if body is not None else None
+    )
+    request_headers = (
+      {"Content-Type": "application/json"} if encoded is not None else {}
+    )
+    if headers:
+      request_headers.update(headers)
+    attempts = 2 if retry_transport_once else 1
+    for attempt in range(attempts):
+      try:
+        response_context = self._client.stream(
+          method, path, content=encoded, headers=request_headers
+        )
+        with response_context as response:
+          length = response.headers.get("content-length")
+          if length:
+            try:
+              if int(length) > MAX_CONTROL_RESPONSE_BYTES:
+                raise ProtocolError(
+                  "control_response_too_large",
+                  "control response is too large",
+                )
+            except ValueError:
+              pass
+          raw = bytearray()
+          for chunk in response.iter_bytes():
+            raw.extend(chunk)
+            if len(raw) > MAX_CONTROL_RESPONSE_BYTES:
               raise ProtocolError(
                 "control_response_too_large",
                 "control response is too large",
               )
-          except ValueError:
-            pass
-        raw = bytearray()
-        for chunk in response.iter_bytes():
-          raw.extend(chunk)
-          if len(raw) > MAX_CONTROL_RESPONSE_BYTES:
-            raise ProtocolError(
-              "control_response_too_large",
-              "control response is too large",
-            )
-        status = response.status_code
-    except ProtocolError:
-      raise
-    except httpx.TimeoutException as exc:
-      raise ProtocolError("control_timeout", "mobius.you timed out", 504) from exc
-    except httpx.HTTPError as exc:
-      raise ProtocolError("control_unreachable", "mobius.you is unreachable", 502) from exc
+          status = response.status_code
+        break
+      except ProtocolError:
+        raise
+      except httpx.TransportError as exc:
+        if attempt + 1 < attempts:
+          time.sleep(CONTROL_RETRY_BACKOFF_SECONDS)
+          continue
+        if isinstance(exc, httpx.TimeoutException):
+          raise ProtocolError(
+            "control_timeout", "mobius.you timed out", 504
+          ) from exc
+        raise ProtocolError(
+          "control_unreachable", "mobius.you is unreachable", 502
+        ) from exc
     try:
       data = json.loads(raw.decode("utf-8"))
     except (json.JSONDecodeError, UnicodeDecodeError) as exc:
@@ -110,6 +136,37 @@ class ControlClient:
     if not isinstance(data, dict):
       raise ProtocolError("invalid_control_response", "control returned invalid JSON")
     return status, data
+
+  def _post_json(
+    self,
+    path: str,
+    body: dict,
+    *,
+    headers: dict[str, str] | None = None,
+    retry_transport_once: bool = False,
+  ) -> tuple[int, dict]:
+    return self._request_json(
+      "POST",
+      path,
+      body,
+      headers=headers,
+      retry_transport_once=retry_transport_once,
+    )
+
+  def _get_json(
+    self,
+    path: str,
+    *,
+    headers: dict[str, str] | None = None,
+    retry_transport_once: bool = False,
+  ) -> tuple[int, dict]:
+    return self._request_json(
+      "GET",
+      path,
+      None,
+      headers=headers,
+      retry_transport_once=retry_transport_once,
+    )
 
   def exchange(self, code: str, instance_id: str) -> ExchangeResult:
     status, data = self._post_json(
@@ -125,6 +182,7 @@ class ControlClient:
           # approved, before it discloses the target capability.
           "build_sha": self._settings.build_sha,
       },
+      retry_transport_once=True,
     )
     if status >= 400:
       error = data.get("error")
@@ -149,39 +207,139 @@ class ControlClient:
       expires_at=parse_expiry(data.get("expires_at")),
     )
 
-  def finish(self, result: ExchangeResult, outcome: str) -> None:
+  @staticmethod
+  def _parse_finish(
+    http_status: int,
+    data: dict,
+    exchange: ExchangeResult,
+    expected_outcome: str,
+  ) -> FinishResult:
+    finish_id = data.get("finish_id")
+    session_id = data.get("session_id")
+    status = data.get("status")
+    outcome = data.get("outcome")
+    status_url = data.get("status_url")
+    if (
+      not isinstance(finish_id, str)
+      or not 8 <= len(finish_id) <= 128
+      or any(char not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-" for char in finish_id)
+      or session_id != exchange.session_id
+      or outcome != expected_outcome
+      or status not in {"queued", "running", "finished", "resumed", "failed"}
+      or not isinstance(status_url, str)
+    ):
+      raise ProtocolError("invalid_control_response", "finish result is malformed")
+    parsed_status_url = urlparse(status_url)
+    expected_url = f"/recovery/finish/{finish_id}"
+    if (
+      parsed_status_url.scheme
+      or parsed_status_url.netloc
+      or parsed_status_url.params
+      or parsed_status_url.query
+      or parsed_status_url.fragment
+      or parsed_status_url.path != expected_url
+    ):
+      raise ProtocolError("invalid_control_response", "finish status URL is invalid")
+    if http_status == 202 and status not in {"queued", "running"}:
+      raise ProtocolError("invalid_control_response", "finish status is invalid")
+    if http_status == 200 and status != "finished":
+      raise ProtocolError("invalid_control_response", "finish status is invalid")
+    if http_status == 503 and status not in {"resumed", "failed"}:
+      raise ProtocolError("invalid_control_response", "finish status is invalid")
+    error_code = None
+    error_message = None
+    target = None
+    expires_at = None
+    if http_status == 503:
+      error = data.get("error")
+      if not isinstance(error, dict):
+        raise ProtocolError("invalid_control_response", "finish error is missing")
+      error_code = str(error.get("code") or "finish_failed")[:80]
+      error_message = str(
+        error.get("message") or "Recovery could not be finished."
+      )[:1000]
+      if error_code == "normal_boot_failed":
+        if status != "resumed":
+          raise ProtocolError(
+            "invalid_control_response", "finish resume status is invalid"
+          )
+        target = TargetCapability.parse(
+          data.get("target_url"), data.get("target_token")
+        )
+        expires_at = parse_expiry(data.get("expires_at"))
+      elif status == "resumed":
+        raise ProtocolError(
+          "invalid_control_response", "finish resume result is invalid"
+        )
+    return FinishResult(
+      finish_id=finish_id,
+      session_id=session_id,
+      status=status,
+      outcome=outcome,
+      status_url=status_url,
+      target=target,
+      expires_at=expires_at,
+      error_code=error_code,
+      error_message=error_message,
+    )
+
+  def finish(self, result: ExchangeResult, outcome: str) -> FinishResult:
     if outcome not in {"recovered", "cancelled"}:
       raise ProtocolError("invalid_outcome", "invalid recovery outcome", 400)
     status, data = self._post_json(
       "/recovery/finish",
       {"session_id": result.session_id, "outcome": outcome},
       headers={"Authorization": f"Bearer {result.session_capability}"},
+      retry_transport_once=True,
     )
-    if status >= 400:
+    if status not in {200, 202, 503}:
       error = data.get("error")
-      if (
-        status == 503
-        and isinstance(error, dict)
-        and error.get("code") == "normal_boot_failed"
-      ):
-        session_id = data.get("session_id")
-        if session_id != result.session_id:
-          raise ProtocolError(
-            "invalid_control_response",
-            "resumed recovery session id does not match",
-          )
-        raise RecoveryResumed(
-          session_id=session_id,
-          target=TargetCapability.parse(
-            data.get("target_url"), data.get("target_token")
-          ),
-          expires_at=parse_expiry(data.get("expires_at")),
-        )
       message = (
         str(error.get("message"))
         if isinstance(error, dict) and error.get("message")
         else "Could not finish the recovery session."
       )
       raise ProtocolError("finish_rejected", message[:500], status)
+    return self._parse_finish(status, data, result, outcome)
+
+  def poll_finish(
+    self,
+    exchange: ExchangeResult,
+    finish: FinishResult,
+  ) -> FinishResult:
+    status, data = self._get_json(
+      finish.status_url,
+      headers={"Authorization": f"Bearer {exchange.session_capability}"},
+      retry_transport_once=True,
+    )
+    if status not in {200, 202, 503}:
+      error = data.get("error")
+      message = (
+        str(error.get("message"))
+        if isinstance(error, dict) and error.get("message")
+        else "Could not read recovery finish status."
+      )
+      raise ProtocolError("finish_status_rejected", message[:500], status)
+    parsed = self._parse_finish(status, data, exchange, finish.outcome)
+    if parsed.finish_id != finish.finish_id:
+      raise ProtocolError("invalid_control_response", "finish id changed")
+    return parsed
+
+  def acknowledge(self, result: ExchangeResult) -> None:
+    """Clears the controller's retry receipt after local session storage."""
+    status, data = self._post_json(
+      "/recovery/exchange/ack",
+      {"session_id": result.session_id},
+      headers={"Authorization": f"Bearer {result.session_capability}"},
+      retry_transport_once=True,
+    )
+    if status >= 400:
+      error = data.get("error")
+      message = (
+        str(error.get("message"))
+        if isinstance(error, dict) and error.get("message")
+        else "Could not acknowledge the recovery exchange."
+      )
+      raise ProtocolError("exchange_ack_rejected", message[:500], status)
     if status >= 300:
       raise ProtocolError("invalid_control_response", "unexpected control redirect")

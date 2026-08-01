@@ -6,7 +6,9 @@ import argparse
 import base64
 import json
 import os
+import posixpath
 import sys
+import threading
 from typing import Any
 
 import httpx
@@ -27,6 +29,24 @@ from .protocol import (
 # local broker cap the wire envelope at 12 MiB while independently enforcing
 # the 8 MiB decoded-data limit.
 MAX_REQUEST_BYTES = 12 * 1024 * 1024
+READ_ROOTS = frozenset({"/data", "/app", "/tmp"})
+WRITE_ROOTS = frozenset({"/data", "/tmp"})
+
+
+def validate_fs_path(path: object, *, writable: bool) -> str:
+  """Applies a lexical least-privilege boundary before target openat2 checks."""
+  if not isinstance(path, str) or not path.startswith("/") or len(path) > 4096:
+    raise ProtocolError("path_forbidden", "target path is outside recovery roots", 403)
+  if "\x00" in path:
+    raise ProtocolError("path_forbidden", "target path is outside recovery roots", 403)
+  normalized = posixpath.normpath(path)
+  if path not in {normalized, normalized + "/"}:
+    raise ProtocolError("path_forbidden", "target path must be canonical", 403)
+  root = "/" + normalized.split("/", 2)[1] if normalized != "/" else "/"
+  allowed = WRITE_ROOTS if writable else READ_ROOTS
+  if root not in allowed:
+    raise ProtocolError("path_forbidden", "target path is outside recovery roots", 403)
+  return normalized
 
 
 class TargetClient:
@@ -43,11 +63,14 @@ class TargetClient:
     *,
     transport: httpx.BaseTransport | None = None,
   ) -> None:
-    self._capability = capability
+    # The client owns a private copy. Revoking a broker must not mutate the
+    # SessionStore's capability and make an intentional broker restart inert.
+    self._capability = TargetCapability(capability.base_url, capability.token)
+    self._revoked = threading.Event()
     self._client = httpx.Client(
-      base_url=capability.base_url,
+      base_url=self._capability.base_url,
       headers={
-        "Authorization": f"Bearer {capability.token}",
+        "Authorization": f"Bearer {self._capability.token}",
         "Accept": "application/json",
         "User-Agent": "mobius-recovery-worker/1",
       },
@@ -66,7 +89,16 @@ class TargetClient:
     return cls(capability)
 
   def close(self) -> None:
+    self.revoke()
+
+  def revoke(self) -> None:
+    """Makes this client unusable and drops all local bearer references."""
+    if self._revoked.is_set():
+      return
+    self._revoked.set()
+    self._client.headers.pop("Authorization", None)
     self._client.close()
+    self._capability.clear()
 
   def _request(
     self,
@@ -76,6 +108,8 @@ class TargetClient:
     *,
     timeout: httpx.Timeout | None = None,
   ) -> dict:
+    if self._revoked.is_set():
+      raise ProtocolError("auth_expired", "recovery session expired", 401)
     encoded = None
     if payload is not None:
       encoded = json.dumps(payload, separators=(",", ":")).encode("utf-8")
@@ -129,6 +163,8 @@ class TargetClient:
             "unexpected_status",
             f"target returned HTTP {response.status_code}",
           )
+        if self._revoked.is_set():
+          raise ProtocolError("auth_expired", "recovery session expired", 401)
         return data
     except ProtocolError:
       raise
@@ -195,6 +231,7 @@ class TargetClient:
   def read(self, path: str, *, offset: int = 0, limit: int = MAX_FILE_BYTES) -> tuple[bytes, bool]:
     if not 0 <= offset or not 1 <= limit <= MAX_FILE_BYTES:
       raise ProtocolError("invalid_request", "invalid read range", 400)
+    path = validate_fs_path(path, writable=False)
     result = self._request(
       "POST",
       "/v1/fs/read",
@@ -214,6 +251,7 @@ class TargetClient:
   ) -> dict:
     if len(data) > MAX_FILE_BYTES:
       raise ProtocolError("request_too_large", "write exceeds 8 MiB", 400)
+    path = validate_fs_path(path, writable=True)
     payload: dict[str, Any] = {
       "path": path,
       "data_base64": base64.b64encode(data).decode("ascii"),
@@ -231,6 +269,7 @@ class TargetClient:
     )
 
   def list(self, path: str) -> list[dict]:
+    path = validate_fs_path(path, writable=False)
     result = self._request(
       "POST",
       "/v1/fs/list",

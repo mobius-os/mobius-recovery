@@ -33,6 +33,11 @@ class TargetCapability:
   base_url: str
   token: str
 
+  def clear(self) -> None:
+    """Drops both parts of the bearer capability from live object graphs."""
+    self.base_url = ""
+    self.token = ""
+
   @classmethod
   def parse(cls, base_url: object, token: object) -> "TargetCapability":
     if not isinstance(base_url, str) or not isinstance(token, str):

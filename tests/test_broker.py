@@ -2,16 +2,22 @@ from __future__ import annotations
 
 import base64
 import json
+import socket
+import threading
+import time
+from datetime import datetime, timedelta, timezone
 
 import httpx
+import pytest
 
 from recovery_worker.broker import BrokerClient, TargetBroker
 from recovery_worker.chat import _environment
 from recovery_worker.protocol import TargetCapability
 from recovery_worker.protocol import MAX_FILE_BYTES
+from recovery_worker.protocol import ProtocolError
 from recovery_worker.providers import subprocess_env
 from recovery_worker.sessions import RecoverySession
-from recovery_worker.target_client import cli
+from recovery_worker.target_client import TargetClient, cli
 
 
 TARGET_TOKEN = "target-secret-" + "x" * 40
@@ -118,3 +124,139 @@ def test_exact_eight_mib_write_crosses_broker_and_target_client(tmp_path) -> Non
     assert result["bytes_written"] == MAX_FILE_BYTES
   finally:
     broker.stop()
+
+
+@pytest.mark.parametrize(
+  ("operation", "path"),
+  [
+    ("read", "/proc/1/mem"),
+    ("read", "/data/../proc/1/environ"),
+    ("read", "/sys/kernel"),
+    ("list", "/dev"),
+    ("read", "/run/secrets/token"),
+    ("write", "/app/recovery_worker/app.py"),
+    ("write", "/data//ambiguous"),
+  ],
+)
+def test_broker_rejects_paths_outside_fixed_roots(
+  tmp_path, operation, path
+) -> None:
+  calls = 0
+
+  def target(_request: httpx.Request) -> httpx.Response:
+    nonlocal calls
+    calls += 1
+    return httpx.Response(500)
+
+  socket_path = tmp_path / "private" / "target.sock"
+  broker = TargetBroker(
+    TargetCapability("http://target.internal", TARGET_TOKEN),
+    transport=httpx.MockTransport(target),
+    path=socket_path,
+  )
+  broker.start()
+  client = BrokerClient(socket_path)
+  try:
+    with pytest.raises(ProtocolError) as forbidden:
+      if operation == "read":
+        client.read(path)
+      elif operation == "write":
+        client.write(path, b"x")
+      else:
+        client.list(path)
+    assert forbidden.value.code == "path_forbidden"
+    assert forbidden.value.status == 403
+    assert calls == 0
+  finally:
+    broker.stop()
+
+
+def test_target_client_rejects_forbidden_path_before_http() -> None:
+  calls = 0
+
+  def target(_request: httpx.Request) -> httpx.Response:
+    nonlocal calls
+    calls += 1
+    return httpx.Response(500)
+
+  client = TargetClient(
+    TargetCapability("http://target.internal", TARGET_TOKEN),
+    transport=httpx.MockTransport(target),
+  )
+  try:
+    with pytest.raises(ProtocolError) as forbidden:
+      client.read("/proc/1/maps")
+    assert forbidden.value.code == "path_forbidden"
+    assert calls == 0
+  finally:
+    client.close()
+
+
+def test_broker_expiry_revokes_idle_connections_and_bearer(tmp_path) -> None:
+  socket_path = tmp_path / "private" / "target.sock"
+  capability = TargetCapability("http://target.internal", TARGET_TOKEN)
+  expired = threading.Event()
+  broker = TargetBroker(
+    capability,
+    transport=httpx.MockTransport(lambda _request: httpx.Response(500)),
+    path=socket_path,
+    expires_at=datetime.now(timezone.utc) + timedelta(milliseconds=150),
+    on_expire=expired.set,
+  )
+  broker.start()
+  idle = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+  idle.settimeout(2)
+  idle.connect(str(socket_path))
+  try:
+    assert expired.wait(2)
+    deadline = time.monotonic() + 2
+    closed = False
+    while time.monotonic() < deadline:
+      try:
+        closed = idle.recv(1) == b""
+      except (BrokenPipeError, ConnectionResetError, OSError):
+        closed = True
+      if closed:
+        break
+      time.sleep(0.01)
+    assert closed
+    assert capability.base_url == "http://target.internal"
+    assert capability.token == TARGET_TOKEN
+    assert broker._target._capability.base_url == ""
+    assert broker._target._capability.token == ""
+    with pytest.raises(ProtocolError) as unavailable:
+      BrokerClient(socket_path).health()
+    assert unavailable.value.code == "broker_unavailable"
+  finally:
+    idle.close()
+    broker.stop()
+
+
+def test_stopped_broker_can_be_reactivated_from_session_capability(tmp_path) -> None:
+  capability = TargetCapability("http://target.internal", TARGET_TOKEN)
+
+  def target(_request: httpx.Request) -> httpx.Response:
+    return httpx.Response(200, json={
+      "status": "ready",
+      "protocol": "mobius-recovery-target/v1",
+      "target": "mobius",
+      "mode": "recovery",
+    })
+
+  transport = httpx.MockTransport(target)
+  first = TargetBroker(
+    capability, transport=transport, path=tmp_path / "first.sock"
+  )
+  first.start()
+  assert BrokerClient(tmp_path / "first.sock").health()["status"] == "ready"
+  first.stop()
+  assert capability.token == TARGET_TOKEN
+
+  second = TargetBroker(
+    capability, transport=transport, path=tmp_path / "second.sock"
+  )
+  second.start()
+  try:
+    assert BrokerClient(tmp_path / "second.sock").health()["status"] == "ready"
+  finally:
+    second.stop()

@@ -7,10 +7,11 @@ import hmac
 import secrets
 import threading
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 
-from .control import ControlClient, ExchangeResult, RecoveryResumed
+from .control import ControlClient, ExchangeResult, FinishResult
 from .protocol import ProtocolError, TargetCapability
 
 
@@ -19,6 +20,9 @@ LOCAL_SESSION_TTL = timedelta(minutes=30)
 START_ATTEMPT_BURST = 6
 START_ATTEMPT_REFILL_SECONDS = 30.0
 MAX_CONCURRENT_STARTS = 1
+MAX_HISTORY_MESSAGES = 100
+MAX_HISTORY_CHARS = 256_000
+MAX_STORED_MESSAGE_CHARS = 64_000
 
 
 @dataclass
@@ -35,6 +39,71 @@ class RecoverySession:
   managed_exchange: ExchangeResult | None = None
   messages: list[Message] = field(default_factory=list)
   readiness_error: str | None = None
+  finish_outcome: str | None = None
+  finish_result: FinishResult | None = None
+  provider_generation: int | None = None
+  _history_chars: int = field(default=0, init=False, repr=False)
+  _messages_lock: threading.Lock = field(
+    default_factory=threading.Lock, init=False, repr=False
+  )
+  _revoked: bool = field(default=False, init=False, repr=False)
+  _revoke_lock: threading.Lock = field(
+    default_factory=threading.Lock, init=False, repr=False
+  )
+  _finish_lock: threading.Lock = field(
+    default_factory=threading.Lock, init=False, repr=False
+  )
+  _finish_quiesced: bool = field(default=False, init=False, repr=False)
+
+  def add_message(self, role: str, content: str) -> None:
+    """Appends history while preserving a hard process-memory bound."""
+    bounded = content[-MAX_STORED_MESSAGE_CHARS:]
+    with self._revoke_lock:
+      if self._revoked:
+        return
+      with self._messages_lock:
+        self.messages.append(Message(role=role, content=bounded))
+        self._history_chars += len(bounded)
+        while (
+          len(self.messages) > MAX_HISTORY_MESSAGES
+          or self._history_chars > MAX_HISTORY_CHARS
+        ):
+          removed = self.messages.pop(0)
+          self._history_chars -= len(removed.content)
+
+  def history(self, limit: int = MAX_HISTORY_MESSAGES) -> list[Message]:
+    with self._messages_lock:
+      return list(self.messages[-limit:])
+
+  @property
+  def revoked(self) -> bool:
+    with self._revoke_lock:
+      return self._revoked
+
+  @property
+  def finishing(self) -> bool:
+    with self._finish_lock:
+      return self.finish_outcome is not None
+
+  def revoke(self) -> None:
+    """Clears every target/control capability and retained conversation."""
+    with self._revoke_lock:
+      if self._revoked:
+        return
+      self._revoked = True
+      target = self.target
+      exchange = self.managed_exchange
+      finish_target = (
+        self.finish_result.target if self.finish_result else None
+      )
+      with self._messages_lock:
+        self.messages.clear()
+        self._history_chars = 0
+    target.clear()
+    if exchange:
+      exchange.clear()
+    if finish_target:
+      finish_target.clear()
 
 
 class SessionStore:
@@ -52,25 +121,55 @@ class SessionStore:
     local_target: TargetCapability | None,
     control: ControlClient | None,
     instance_id: str | None,
+    on_revoke: Callable[[RecoverySession, str], None] | None = None,
+    on_resume: Callable[[RecoverySession], None] | None = None,
+    on_finish_accepted: Callable[[RecoverySession], None] | None = None,
   ) -> None:
     self._local_token = local_token
     self._local_target = local_target
     self._control = control
     self._instance_id = instance_id
+    self._on_revoke = on_revoke
+    self._on_resume = on_resume
+    self._on_finish_accepted = on_finish_accepted
     self._sessions: dict[str, RecoverySession] = {}
     self._used_codes: set[str] = set()
     self._starting_codes: set[str] = set()
     self._start_tokens = float(START_ATTEMPT_BURST)
     self._start_refill_at = time.monotonic()
     self._start_inflight = 0
+    self._expiry_timer: threading.Timer | None = None
     self._lock = threading.Lock()
 
   @staticmethod
   def _digest(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
 
+  def _schedule_expiry_locked(self) -> None:
+    """Schedules the next deadline; caller must hold the store lock."""
+    if self._expiry_timer:
+      self._expiry_timer.cancel()
+      self._expiry_timer = None
+    if not self._sessions:
+      return
+    deadline = min(session.expires_at for session in self._sessions.values())
+    delay = max(
+      0.0,
+      (deadline - datetime.now(timezone.utc)).total_seconds(),
+    )
+    self._expiry_timer = threading.Timer(delay, self.expire)
+    self._expiry_timer.daemon = True
+    self._expiry_timer.start()
+
   def start(self, code: str, instance_id: str | None) -> tuple[str, RecoverySession]:
     if not isinstance(code, str) or not code.strip() or len(code) > 4096:
+      raise ProtocolError("auth_failed", "Recovery link is invalid or expired.", 401)
+    # Reject target selection before touching the process-global launch bucket.
+    # A hostile instance id must not consume another instance's wake allowance.
+    if self._control is not None and (
+      not instance_id
+      or not hmac.compare_digest(instance_id, self._instance_id or "")
+    ):
       raise ProtocolError("auth_failed", "Recovery link is invalid or expired.", 401)
     code = code.strip()
     code_digest = self._digest(code)
@@ -100,8 +199,7 @@ class SessionStore:
 
     try:
       if self._control is not None:
-        if not instance_id or not hmac.compare_digest(instance_id, self._instance_id or ""):
-          raise ProtocolError("auth_failed", "Recovery link is invalid or expired.", 401)
+        assert instance_id is not None
         exchange = self._control.exchange(code, instance_id)
         session = RecoverySession(
           session_id=exchange.session_id,
@@ -135,9 +233,60 @@ class SessionStore:
       self._starting_codes.discard(code_digest)
       self._start_inflight -= 1
       self._used_codes.add(code_digest)
+      replaced = list(self._sessions.values())
       self._sessions.clear()
       self._sessions[browser_digest] = session
+      self._schedule_expiry_locked()
+    for old in replaced:
+      self._revoke(old, "replaced")
+    if session.managed_exchange and self._control:
+      # The durable retry receipt is cleared only after the parsed capability
+      # is reachable from this store. ACK is idempotent and transport-retried;
+      # an ACK failure never discards the already usable recovery session.
+      acknowledge = getattr(self._control, "acknowledge", None)
+      if acknowledge:
+        try:
+          acknowledge(session.managed_exchange)
+        except ProtocolError:
+          pass
     return browser_token, session
+
+  def _revoke(self, session: RecoverySession, reason: str) -> None:
+    # Mark the session dead and erase its directly held capabilities before
+    # any slower broker/process cleanup. New work must fail while cleanup runs.
+    session.revoke()
+    if self._on_revoke:
+      self._on_revoke(session, reason)
+
+  def expire(self) -> int:
+    """Revokes all sessions whose controller deadline has passed."""
+    now = datetime.now(timezone.utc)
+    with self._lock:
+      self._expiry_timer = None
+      expired = [
+        (digest, session)
+        for digest, session in self._sessions.items()
+        if session.expires_at <= now
+      ]
+      for digest, _session in expired:
+        self._sessions.pop(digest, None)
+      # Wall clocks can move and Timer may be awakened spuriously. Always
+      # re-arm the nearest surviving deadline instead of losing cleanup.
+      self._schedule_expiry_locked()
+    for _digest, session in expired:
+      self._revoke(session, "expired")
+    return len(expired)
+
+  def close(self) -> None:
+    """Revokes all state during process shutdown."""
+    with self._lock:
+      sessions = list(self._sessions.values())
+      self._sessions.clear()
+      if self._expiry_timer:
+        self._expiry_timer.cancel()
+        self._expiry_timer = None
+    for session in sessions:
+      self._revoke(session, "shutdown")
 
   def get(self, browser_token: str | None) -> RecoverySession | None:
     if not browser_token:
@@ -145,13 +294,121 @@ class SessionStore:
     digest = self._digest(browser_token)
     with self._lock:
       session = self._sessions.get(digest)
-      if session and session.expires_at > datetime.now(timezone.utc):
+      if (
+        session
+        and not session.revoked
+        and session.expires_at > datetime.now(timezone.utc)
+      ):
         return session
       if session:
         self._sessions.pop(digest, None)
+        self._schedule_expiry_locked()
+    if session:
+      self._revoke(session, "expired")
     return None
 
-  def finish(self, browser_token: str, outcome: str) -> RecoverySession:
+  @staticmethod
+  def _finish_payload(
+    session: RecoverySession,
+    result: FinishResult | None,
+  ) -> dict:
+    payload = {
+      "status": result.status if result else "queued",
+      "outcome": session.finish_outcome,
+    }
+    if result and result.finish_id:
+      payload["finish_id"] = result.finish_id
+    if result and result.error_code:
+      payload["error"] = {
+        "code": result.error_code,
+        "message": result.error_message or "Recovery could not be finished.",
+      }
+    return payload
+
+  def _quiesce_finish(self, session: RecoverySession, outcome: str) -> None:
+    with session._finish_lock:
+      if session.finish_outcome is not None and session.finish_outcome != outcome:
+        raise ProtocolError(
+          "finish_outcome_conflict",
+          "Recovery is already finishing with a different outcome.",
+          409,
+        )
+      if session._finish_quiesced:
+        return
+      session.finish_outcome = outcome
+    try:
+      if self._on_finish_accepted:
+        self._on_finish_accepted(session)
+      with session._finish_lock:
+        session._finish_quiesced = True
+    finally:
+      # The session capability is still needed for polling; the target bearer
+      # is not. Clear it even if process cleanup reports an error.
+      session.target.clear()
+
+  def _apply_finish_result(
+    self,
+    digest: str,
+    session: RecoverySession,
+    result: FinishResult,
+  ) -> dict:
+    with session._finish_lock:
+      if session.finish_outcome != result.outcome:
+        # A concurrent terminal normal-boot failure already resumed the
+        # session; a slower pending response must not put it back into finish.
+        if result.target:
+          result.target.clear()
+        return {"status": "resumed", "outcome": result.outcome}
+      current = session.finish_result
+      if current and current.finish_id != result.finish_id:
+        if result.target:
+          result.target.clear()
+        raise ProtocolError("invalid_control_response", "finish id changed")
+      if current and not current.pending:
+        if result.target:
+          result.target.clear()
+        return self._finish_payload(session, current)
+      session.finish_result = result
+    if result.pending:
+      return self._finish_payload(session, result)
+    if result.status == "finished":
+      with self._lock:
+        removed = self._sessions.pop(digest, None)
+        self._schedule_expiry_locked()
+      if removed:
+        self._revoke(session, "finished")
+      return self._finish_payload(session, result)
+    if (
+      result.error_code == "normal_boot_failed"
+      and result.target is not None
+      and result.expires_at is not None
+    ):
+      with self._lock:
+        if self._sessions.get(digest) is not session or session.revoked:
+          result.target.clear()
+          raise ProtocolError("auth_expired", "Recovery session expired.", 401)
+        # Store lock first prevents the expiry callback from removing the old
+        # deadline while the fresh controller grant is installed.
+        with session._finish_lock:
+          session.target = result.target
+          session.expires_at = result.expires_at
+          assert session.managed_exchange is not None
+          session.managed_exchange.target = result.target
+          session.managed_exchange.expires_at = result.expires_at
+          session.finish_outcome = None
+          session.finish_result = None
+          session._finish_quiesced = False
+        self._schedule_expiry_locked()
+      if self._on_resume:
+        try:
+          self._on_resume(session)
+          session.readiness_error = None
+        except (OSError, ProtocolError):
+          session.readiness_error = "The local target broker could not start."
+      return {"status": "resumed", "outcome": result.outcome}
+    return self._finish_payload(session, result)
+
+  def begin_finish(self, browser_token: str, outcome: str) -> dict:
     if outcome not in {"recovered", "cancelled"}:
       raise ProtocolError("invalid_outcome", "invalid recovery outcome", 400)
     digest = self._digest(browser_token)
@@ -159,21 +416,62 @@ class SessionStore:
       session = self._sessions.get(digest)
     if session is None:
       raise ProtocolError("auth_failed", "Recovery session expired.", 401)
-    if session.managed_exchange and self._control:
-      try:
-        self._control.finish(session.managed_exchange, outcome)
-      except RecoveryResumed as resumed:
-        with self._lock:
-          # Swap all target-bearing state together. The existing browser and
-          # finish capabilities remain valid for the resumed session.
-          session.target = resumed.target
-          session.expires_at = resumed.expires_at
-          session.managed_exchange.target = resumed.target
-          session.managed_exchange.expires_at = resumed.expires_at
+    if not session.managed_exchange or not self._control:
+      with self._lock:
+        removed = self._sessions.pop(digest, None)
+        self._schedule_expiry_locked()
+      if removed:
+        self._revoke(session, "finished")
+      return {"status": "finished", "outcome": outcome}
+
+    with session._finish_lock:
+      if session.finish_outcome and session.finish_outcome != outcome:
+        raise ProtocolError(
+          "finish_outcome_conflict",
+          "Recovery is already finishing with a different outcome.",
+          409,
+        )
+      existing = session.finish_result
+      if existing and not existing.pending:
+        return self._finish_payload(session, existing)
+
+    try:
+      result = self._control.finish(session.managed_exchange, outcome)
+    except ProtocolError as exc:
+      if exc.code not in {"control_timeout", "control_unreachable"}:
         raise
+      # A lost response may follow a committed 202. Freeze the target and let
+      # the same idempotent POST recover the durable job on the next poll.
+      self._quiesce_finish(session, outcome)
+      return self._finish_payload(session, None)
+
+    self._quiesce_finish(session, outcome)
+    return self._apply_finish_result(digest, session, result)
+
+  def poll_finish(self, browser_token: str) -> dict:
+    digest = self._digest(browser_token)
     with self._lock:
-      self._sessions.clear()
-    session.target.token = ""  # Destroy the in-memory target capability.
-    if session.managed_exchange:
-      session.managed_exchange.session_capability = ""
-    return session
+      session = self._sessions.get(digest)
+    if session is None:
+      raise ProtocolError("auth_failed", "Recovery session expired.", 401)
+    with session._finish_lock:
+      outcome = session.finish_outcome
+      existing = session.finish_result
+    if not outcome:
+      raise ProtocolError("finish_not_started", "Recovery is not finishing.", 409)
+    if existing and not existing.pending:
+      return self._finish_payload(session, existing)
+    if existing is None:
+      return self.begin_finish(browser_token, outcome)
+    assert session.managed_exchange is not None and self._control is not None
+    try:
+      result = self._control.poll_finish(session.managed_exchange, existing)
+    except ProtocolError as exc:
+      if exc.code in {"control_timeout", "control_unreachable"}:
+        return self._finish_payload(session, existing)
+      raise
+    return self._apply_finish_result(digest, session, result)
+
+  def finish(self, browser_token: str, outcome: str) -> dict:
+    """Backward-compatible name for the non-blocking finish start."""
+    return self.begin_finish(browser_token, outcome)

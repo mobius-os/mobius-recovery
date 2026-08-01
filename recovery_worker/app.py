@@ -6,6 +6,7 @@ import asyncio
 import hmac
 import json
 import secrets
+import threading
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from urllib.parse import parse_qs
@@ -18,7 +19,7 @@ from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 from .chat import claim_finish, release_finish, stream_turn, turn_active
 from .broker import BROKER_SOCKET, TargetBroker
 from .config import WORKER_PROTOCOL_VERSION, Settings
-from .control import ControlClient, RecoveryResumed
+from .control import ControlClient
 from .pages import closed_page, login_page, lost_page, recovery_page
 from .protocol import ProtocolError, TargetCapability
 from .providers import ProviderAuth
@@ -32,6 +33,98 @@ MAX_START_BODY = 16 * 1024
 CLOSED_COOKIE = "mobius_recovery_closed"
 SSE_KEEPALIVE_SECONDS = 15.0
 MAX_BROWSER_SESSION_SECONDS = 60 * 60
+
+
+def _target_health(
+  capability: TargetCapability,
+  transport: httpx.BaseTransport | None,
+) -> dict:
+  target = TargetClient(capability, transport=transport)
+  try:
+    return target.health()
+  finally:
+    target.close()
+
+
+class RecoveryRuntime:
+  """Serializes broker/provider ownership for the one active session."""
+
+  def __init__(self, providers: ProviderAuth, *, target_transport, broker_path) -> None:
+    self._providers = providers
+    self._target_transport = target_transport
+    self._broker_path = broker_path or BROKER_SOCKET
+    self._active: tuple[str, TargetBroker] | None = None
+    self._sessions: SessionStore | None = None
+    self._lock = threading.RLock()
+
+  def bind_sessions(self, sessions: SessionStore) -> None:
+    self._sessions = sessions
+
+  def _broker_expired(self) -> None:
+    sessions = self._sessions
+    if sessions:
+      sessions.expire()
+
+  def activate(self, session: RecoverySession, *, clear_providers: bool = True) -> None:
+    if session.revoked or session.expires_at <= datetime.now(timezone.utc):
+      raise ProtocolError("auth_expired", "Recovery session expired.", 401)
+    with self._lock:
+      if session.revoked or session.expires_at <= datetime.now(timezone.utc):
+        raise ProtocolError("auth_expired", "Recovery session expired.", 401)
+      if self._active:
+        self._active[1].stop()
+        self._active = None
+      if clear_providers:
+        self._providers.clear()
+      broker = None
+      try:
+        session.provider_generation = self._providers.enable()
+        broker = TargetBroker(
+          session.target,
+          transport=self._target_transport,
+          path=self._broker_path,
+          expires_at=session.expires_at,
+          on_expire=self._broker_expired,
+        )
+        broker.start()
+        if session.revoked or session.expires_at <= datetime.now(timezone.utc):
+          raise ProtocolError("auth_expired", "Recovery session expired.", 401)
+        self._active = (session.session_id, broker)
+      except Exception:
+        if broker:
+          broker.stop()
+        self._providers.clear()
+        session.provider_generation = None
+        raise
+
+  def revoke(self, session: RecoverySession, _reason: str) -> None:
+    with self._lock:
+      session.provider_generation = None
+      active = None
+      if self._active and self._active[0] == session.session_id:
+        active = self._active[1]
+        self._active = None
+      try:
+        if active:
+          active.stop()
+      finally:
+        self._providers.clear()
+
+  def resume(self, session: RecoverySession) -> None:
+    self.activate(session, clear_providers=False)
+
+  def quiesce(self, session: RecoverySession) -> None:
+    """Stops every target-capable process while retaining poll capability."""
+    self.revoke(session, "finishing")
+
+  def close(self) -> None:
+    with self._lock:
+      try:
+        if self._active:
+          self._active[1].stop()
+          self._active = None
+      finally:
+        self._providers.clear()
 
 
 def _nonce() -> str:
@@ -186,6 +279,7 @@ def create_app(
 ) -> FastAPI:
   """Creates one worker app; injection points are test-only transports."""
   settings = settings or Settings.from_env()
+  settings.validate()
   control = (
     ControlClient(settings, transport=control_transport)
     if settings.managed else None
@@ -195,24 +289,31 @@ def create_app(
       settings.local_target_url, settings.local_target_token
     )
   )
+  providers = ProviderAuth()
+  runtime = RecoveryRuntime(
+    providers,
+    target_transport=target_transport,
+    broker_path=broker_path,
+  )
   sessions = SessionStore(
     local_token=settings.local_token,
     local_target=local_target,
     control=control,
     instance_id=settings.instance_id,
+    on_revoke=runtime.revoke,
+    on_resume=runtime.resume,
+    on_finish_accepted=runtime.quiesce,
   )
-  providers = ProviderAuth()
-  broker: dict[str, TargetBroker | None] = {"active": None}
+  runtime.bind_sessions(sessions)
 
   @asynccontextmanager
   async def lifespan(_app: FastAPI):
     harden_process()
     yield
-    providers.terminate()
-    if broker["active"]:
-      broker["active"].stop()
+    await asyncio.to_thread(sessions.close)
+    await asyncio.to_thread(runtime.close)
     if control:
-      control.close()
+      await asyncio.to_thread(control.close)
 
   app = FastAPI(
     title="Mobius Recovery Worker",
@@ -224,6 +325,7 @@ def create_app(
   app.state.settings = settings
   app.state.sessions = sessions
   app.state.providers = providers
+  app.state.runtime = runtime
 
   @app.exception_handler(ProtocolError)
   async def protocol_error(_request: Request, exc: ProtocolError):
@@ -232,12 +334,52 @@ def create_app(
       content={"error": {"code": exc.code, "message": exc.message}},
     ))
 
-  def current(request: Request) -> tuple[str, RecoverySession]:
+  async def current(request: Request) -> tuple[str, RecoverySession]:
     token = request.cookies.get(COOKIE_NAME)
-    session = sessions.get(token)
+    session = await asyncio.to_thread(sessions.get, token)
     if not token or session is None:
       raise ProtocolError("auth_required", "Recovery session expired.", 401)
     return token, session
+
+  async def interactive(request: Request) -> tuple[str, RecoverySession]:
+    token, session = await current(request)
+    if session.finishing:
+      raise ProtocolError(
+        "finish_in_progress",
+        "Recovery is already finishing; target access is closed.",
+        409,
+      )
+    return token, session
+
+  def launch_origin(request: Request) -> None:
+    if not settings.managed:
+      _same_origin(request)
+      return
+    fetch_site = request.headers.get("sec-fetch-site", "").lower()
+    if fetch_site not in {"cross-site", "same-site", "same-origin"}:
+      raise ProtocolError("cross_site", "Recovery handoff origin rejected.", 403)
+    supplied = urlparse(request.headers.get("origin", ""))
+    expected = urlparse(settings.control_plane_url or "")
+    try:
+      supplied_port = supplied.port or (443 if supplied.scheme == "https" else 80)
+      expected_port = expected.port or (443 if expected.scheme == "https" else 80)
+    except ValueError as exc:
+      raise ProtocolError(
+        "cross_site", "Recovery handoff origin rejected.", 403
+      ) from exc
+    if (
+      supplied.scheme != expected.scheme
+      or not supplied.hostname
+      or supplied.hostname.lower() != (expected.hostname or "").lower()
+      or supplied_port != expected_port
+      or supplied.path not in {"", "/"}
+      or supplied.params
+      or supplied.query
+      or supplied.fragment
+      or supplied.username
+      or supplied.password
+    ):
+      raise ProtocolError("cross_site", "Recovery handoff origin rejected.", 403)
 
   @app.get("/health")
   async def health():
@@ -285,11 +427,9 @@ def create_app(
     ):
       raise ProtocolError("invalid_target", "Managed target URL is invalid.", 400)
     capability = TargetCapability.parse(target_url, payload.get("target_token"))
-    target = TargetClient(capability, transport=target_transport)
-    try:
-      result = target.health()
-    finally:
-      target.close()
+    result = await asyncio.to_thread(
+      _target_health, capability, target_transport
+    )
     if result.get("mode") != "recovery" or result.get("target") != "mobius":
       raise ProtocolError(
         "target_not_recovery",
@@ -309,7 +449,7 @@ def create_app(
   async def index(request: Request):
     nonce = _nonce()
     browser_token = request.cookies.get(COOKIE_NAME)
-    session = sessions.get(browser_token)
+    session = await asyncio.to_thread(sessions.get, browser_token)
     if session is None:
       closed = request.cookies.get(CLOSED_COOKIE)
       if closed in {"recovered", "cancelled"}:
@@ -333,17 +473,22 @@ def create_app(
         build_sha=settings.build_sha,
         session_id=session.session_id,
         readiness_error=session.readiness_error,
+        finishing=session.finishing,
+        finish_result=session.finish_result,
       )
     return _security_headers(HTMLResponse(body), nonce)
 
   @app.post("/session/start", response_class=HTMLResponse)
   async def session_start(request: Request):
     nonce = _nonce()
+    launch_origin(request)
     try:
       form = await _start_form(request)
       code = form.get("code", "")
       instance_id = form.get("instance_id") or None
-      browser_token, session = sessions.start(code, instance_id)
+      browser_token, session = await asyncio.to_thread(
+        sessions.start, code, instance_id
+      )
     except ProtocolError as exc:
       body = login_page(
         nonce,
@@ -352,24 +497,13 @@ def create_app(
       )
       return _security_headers(HTMLResponse(body, status_code=exc.status), nonce)
     try:
-      target = TargetClient(session.target, transport=target_transport)
-      try:
-        target.health()
-      finally:
-        target.close()
+      await asyncio.to_thread(_target_health, session.target, target_transport)
       session.readiness_error = None
     except ProtocolError as exc:
       session.readiness_error = exc.message
     try:
-      if broker["active"]:
-        broker["active"].stop()
-      broker["active"] = TargetBroker(
-        session.target,
-        transport=target_transport,
-        path=broker_path or BROKER_SOCKET,
-      )
-      broker["active"].start()
-    except OSError:
+      await asyncio.to_thread(runtime.activate, session)
+    except (OSError, ProtocolError):
       session.readiness_error = "The local target broker could not start."
     body = recovery_page(
       nonce,
@@ -399,67 +533,75 @@ def create_app(
 
   @app.get("/api/providers")
   async def provider_status(request: Request):
-    current(request)
-    return _security_headers(JSONResponse(providers.status()))
+    await interactive(request)
+    status = await asyncio.to_thread(providers.status)
+    return _security_headers(JSONResponse(status))
 
   @app.get("/api/target/health")
   async def target_health(request: Request):
-    _, session = current(request)
-    target = TargetClient(session.target, transport=target_transport)
+    _, session = await interactive(request)
     try:
-      result = target.health()
+      result = await asyncio.to_thread(
+        _target_health, session.target, target_transport
+      )
       session.readiness_error = None
       return _security_headers(JSONResponse({"status": "ready", "target": result}))
     except ProtocolError as exc:
       session.readiness_error = exc.message
       raise
-    finally:
-      target.close()
 
   @app.post("/api/providers/claude/start")
   async def claude_start(request: Request):
     _same_origin(request)
-    current(request)
-    return _security_headers(JSONResponse(providers.claude_start()))
+    await interactive(request)
+    result = await asyncio.to_thread(providers.claude_start)
+    return _security_headers(JSONResponse(result))
 
   @app.post("/api/providers/claude/exchange")
   async def claude_exchange(request: Request):
     _same_origin(request)
-    current(request)
+    await interactive(request)
     payload = await _json_body(request)
-    providers.claude_exchange(str(payload.get("code") or ""))
+    await asyncio.to_thread(
+      providers.claude_exchange, str(payload.get("code") or "")
+    )
     return _security_headers(JSONResponse({"status": "connected"}))
 
   @app.post("/api/providers/codex/start")
   async def codex_start(request: Request):
     _same_origin(request)
-    current(request)
-    return _security_headers(JSONResponse(providers.codex_start()))
+    await interactive(request)
+    result = await asyncio.to_thread(providers.codex_start)
+    return _security_headers(JSONResponse(result))
 
   @app.get("/api/providers/codex/status")
   async def codex_status(request: Request):
-    current(request)
-    return _security_headers(JSONResponse(providers.codex_status()))
+    await interactive(request)
+    status = await asyncio.to_thread(providers.codex_status)
+    return _security_headers(JSONResponse(status))
 
   @app.get("/api/history")
   async def history(request: Request):
-    _, session = current(request)
+    _, session = await current(request)
     return _security_headers(JSONResponse({
       "messages": [
         {"role": message.role, "content": message.content}
-        for message in session.messages[-100:]
+        for message in session.history()
       ]
     }))
 
   @app.get("/api/turn")
   async def turn_status(request: Request):
-    current(request)
-    return _security_headers(JSONResponse({"active": turn_active()}))
+    _, session = await current(request)
+    return _security_headers(JSONResponse({
+      "active": turn_active(),
+      "finishing": session.finishing,
+    }))
 
   @app.post("/api/chat/stream")
   async def chat_stream(request: Request):
     _same_origin(request)
-    _, session = current(request)
+    _, session = await interactive(request)
     payload = await _json_body(request)
     message = payload.get("message")
     provider = payload.get("provider")
@@ -467,7 +609,7 @@ def create_app(
       raise ProtocolError("invalid_request", "Message and provider are required.", 400)
 
     async def events():
-      iterator = stream_turn(message, provider, session).__aiter__()
+      iterator = stream_turn(message, provider, session, providers).__aiter__()
       async for frame in _sse_events(iterator):
         yield frame
 
@@ -480,7 +622,7 @@ def create_app(
   @app.post("/api/finish")
   async def finish(request: Request):
     _same_origin(request)
-    token, _ = current(request)
+    token, _ = await current(request)
     payload = await _json_body(request)
     outcome = payload.get("outcome")
     if not isinstance(outcome, str):
@@ -492,45 +634,41 @@ def create_app(
         409,
       )
     try:
-      try:
-        sessions.finish(token, outcome)
-      except RecoveryResumed:
-        # The controller already put the target back into recovery mode with a
-        # replacement bearer. Keep the browser session and rebuild only the
-        # fixed local broker; the worker itself is unchanged.
-        _, resumed = current(request)
-        if broker["active"]:
-          broker["active"].stop()
-        broker["active"] = TargetBroker(
-          resumed.target,
-          transport=target_transport,
-          path=broker_path or BROKER_SOCKET,
-        )
-        broker["active"].start()
-        raise
-      if broker["active"]:
-        broker["active"].stop()
-        broker["active"] = None
-      providers.clear()
+      progress = await asyncio.to_thread(sessions.begin_finish, token, outcome)
     finally:
       release_finish()
-    response = JSONResponse({"status": "finished", "outcome": outcome})
-    response.delete_cookie(
-      COOKIE_NAME,
-      path="/",
-      secure=settings.secure_cookie,
-      httponly=True,
-      samesite="strict",
+    return _finish_http_response(progress)
+
+  @app.get("/api/finish/status")
+  async def finish_status(request: Request):
+    token, _session = await current(request)
+    progress = await asyncio.to_thread(sessions.poll_finish, token)
+    return _finish_http_response(progress)
+
+  def _finish_http_response(progress: dict):
+    status = progress.get("status")
+    response = JSONResponse(
+      progress,
+      status_code=202 if status in {"queued", "running"} else 200,
     )
-    response.set_cookie(
-      CLOSED_COOKIE,
-      outcome,
-      max_age=600,
-      httponly=True,
-      secure=settings.secure_cookie,
-      samesite="strict",
-      path="/",
-    )
+    if status == "finished":
+      outcome = str(progress.get("outcome") or "recovered")
+      response.delete_cookie(
+        COOKIE_NAME,
+        path="/",
+        secure=settings.secure_cookie,
+        httponly=True,
+        samesite="strict",
+      )
+      response.set_cookie(
+        CLOSED_COOKIE,
+        outcome,
+        max_age=600,
+        httponly=True,
+        secure=settings.secure_cookie,
+        samesite="strict",
+        path="/",
+      )
     return _security_headers(response)
 
   return app

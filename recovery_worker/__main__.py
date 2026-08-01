@@ -1,4 +1,4 @@
-"""Development entrypoint; the production image invokes uvicorn directly."""
+"""PID-1 production entrypoint that validates settings before starting uvicorn."""
 
 import uvicorn
 

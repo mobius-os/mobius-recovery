@@ -58,7 +58,7 @@ assert not bad, bad
 # hardened worker directly as PID 1.
 if docker run --rm --init \
   -e MOBIUS_RECOVERY_CONTROL_PLANE_URL=https://control.invalid \
-  -e MOBIUS_RECOVERY_INSTANCE_ID=verify-instance \
+  -e MOBIUS_RECOVERY_INSTANCE_ID=mob_verify-instance \
   -e MOBIUS_RECOVERY_SERVICE_ID=verify-service \
   -e MOBIUS_RECOVERY_BOOTSTRAP_SECRET=verify-bootstrap-secret-0000000000000000 \
   "$image" >/dev/null 2>&1; then
@@ -68,7 +68,7 @@ fi
 
 container=$(docker run -d \
   -e MOBIUS_RECOVERY_CONTROL_PLANE_URL=https://control.invalid \
-  -e MOBIUS_RECOVERY_INSTANCE_ID=verify-instance \
+  -e MOBIUS_RECOVERY_INSTANCE_ID=mob_verify-instance \
   -e MOBIUS_RECOVERY_SERVICE_ID=verify-service \
   -e MOBIUS_RECOVERY_BOOTSTRAP_SECRET=verify-bootstrap-secret-0000000000000000 \
   -e MOBIUS_RECOVERY_BUILD_SHA=spoofed-runtime-value \

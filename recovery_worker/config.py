@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import urlparse
@@ -12,6 +13,7 @@ WORKER_PROTOCOL_VERSION = "mobius-recovery-worker/v1"
 TARGET_PROTOCOL_VERSION = "mobius-recovery-target/v1"
 STATE_DIR = Path(os.environ.get("MOBIUS_RECOVERY_STATE_DIR", "/state"))
 BUILD_REVISION_PATH = Path(__file__).resolve().parents[1] / "BUILD_REVISION"
+MANAGED_INSTANCE_ID = re.compile(r"mob_[A-Za-z0-9_-]{3,80}\Z")
 
 
 def baked_build_revision() -> str:
@@ -107,6 +109,35 @@ class Settings:
       if len(self.bootstrap_secret or "") < 32:
         raise RuntimeError(
           "MOBIUS_RECOVERY_BOOTSTRAP_SECRET must be at least 32 chars"
+        )
+      if not MANAGED_INSTANCE_ID.fullmatch(self.instance_id or ""):
+        raise RuntimeError(
+          "MOBIUS_RECOVERY_INSTANCE_ID must be a valid mob_ instance id"
+        )
+      parsed_control = urlparse(self.control_plane_url or "")
+      try:
+        control_port = parsed_control.port
+      except ValueError as exc:
+        raise RuntimeError(
+          "MOBIUS_RECOVERY_CONTROL_PLANE_URL must be an HTTPS origin"
+        ) from exc
+      if (
+        parsed_control.scheme != "https"
+        or not parsed_control.hostname
+        or parsed_control.path not in {"", "/"}
+        or parsed_control.params
+        or parsed_control.query
+        or parsed_control.fragment
+        or parsed_control.username
+        or parsed_control.password
+        or control_port is not None and not 1 <= control_port <= 65535
+      ):
+        raise RuntimeError(
+          "MOBIUS_RECOVERY_CONTROL_PLANE_URL must be an HTTPS origin"
+        )
+      if not self.secure_cookie:
+        raise RuntimeError(
+          "MOBIUS_RECOVERY_SECURE_COOKIE must be enabled in managed mode"
         )
     else:
       for name, value in (

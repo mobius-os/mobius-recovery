@@ -39,3 +39,11 @@ def harden_process() -> None:
     raise RuntimeError(
       f"PR_SET_NO_NEW_PRIVS hardening failed with errno {error}"
     )
+  # Provider CLIs may spawn helpers that create their own session. Acting as a
+  # subreaper keeps those escaped descendants attached to this PID 1 so session
+  # revocation can still terminate them.
+  if prctl(36, 1, 0, 0, 0) != 0:
+    error = ctypes.get_errno()
+    raise RuntimeError(
+      f"PR_SET_CHILD_SUBREAPER hardening failed with errno {error}"
+    )

@@ -18,7 +18,7 @@ def settings() -> Settings:
     service_id="recovery-service",
     secure_cookie=True,
     control_plane_url="https://mobius.you",
-    instance_id="instance-1",
+    instance_id="mob_instance-1",
     bootstrap_secret=BOOTSTRAP,
     local_target_url=None,
     local_target_token=None,
