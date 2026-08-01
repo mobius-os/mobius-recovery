@@ -21,6 +21,7 @@ from .providers import (
 )
 from .protocol import ProtocolError
 from .sessions import RecoverySession
+from .workspace import SessionWorkspaces
 
 
 MAX_MESSAGE_CHARS = 32_000
@@ -110,6 +111,11 @@ def turn_active() -> bool:
     return _running
 
 
+def finish_active() -> bool:
+  with _run_guard:
+    return _finishing
+
+
 def _kill_group(proc: asyncio.subprocess.Process, sig: int) -> None:
   try:
     os.killpg(proc.pid, sig)
@@ -136,8 +142,10 @@ async def _terminate(proc: asyncio.subprocess.Process) -> None:
 def _environment(session: RecoverySession, provider: str) -> dict[str, str]:
   env = subprocess_env()
   env.update({
-    "HOME": str(STATE_DIR),
-    "PYTHONPATH": "/app",
+    # Generic CLI/user memory belongs to the unpredictable session workspace,
+    # not the process-wide /state home. Provider credentials remain in their
+    # explicit directories and both locations are destroyed on quiesce.
+    "HOME": str(session.workspace or STATE_DIR),
     "MOBIUS_RECOVERY_BROKER_SOCKET": str(
       STATE_DIR / "broker" / "target.sock"
     ),
@@ -167,13 +175,17 @@ async def _spawn(
   provider: str,
   session: RecoverySession,
   provider_auth: ProviderAuth,
+  workspaces: SessionWorkspaces,
 ) -> AsyncIterator[dict]:
   binary = shutil.which(provider)
   if not binary:
     yield {"type": "error", "message": f"{provider} CLI is unavailable."}
     return
-  workspace = STATE_DIR / "workspace"
-  workspace.mkdir(parents=True, exist_ok=True)
+  try:
+    workspace = workspaces.validate(session.workspace)
+  except OSError:
+    yield {"type": "error", "message": "Recovery workspace is unavailable."}
+    return
   prompt = _history(session)
   if provider == "claude":
     command = [
@@ -313,6 +325,7 @@ async def stream_turn(
   provider: str,
   session: RecoverySession,
   provider_auth: ProviderAuth,
+  workspaces: SessionWorkspaces,
 ) -> AsyncIterator[dict]:
   if provider not in {"claude", "codex"}:
     yield {"type": "error", "message": "Unsupported provider."}
@@ -333,7 +346,9 @@ async def stream_turn(
     return
   session.add_message("user", message.strip())
   try:
-    async for event in _spawn(provider, session, provider_auth):
+    async for event in _spawn(
+      provider, session, provider_auth, workspaces
+    ):
       yield event
   except asyncio.CancelledError:
     raise

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+import hashlib
 import threading
 
 import httpx
@@ -23,6 +24,18 @@ from recovery_worker.sessions import (
 LOCAL_CODE = "local-code-" + "c" * 32
 OLD_TOKEN = "old-target-" + "o" * 32
 NEW_TOKEN = "new-target-" + "n" * 32
+MANAGED_TARGET_URL = "http://mobius.railway.internal:18002"
+
+
+def _target_token_sha256(token: str) -> str:
+  return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+
+def _validate_managed_target(
+  target: TargetCapability, advertised_token_sha256: object
+) -> None:
+  assert target.base_url == MANAGED_TARGET_URL
+  assert advertised_token_sha256 == _target_token_sha256(target.token)
 
 
 def test_wrong_managed_instance_does_not_consume_global_launch_limit() -> None:
@@ -33,7 +46,7 @@ def test_wrong_managed_instance_does_not_consume_global_launch_limit() -> None:
       self.calls += 1
       return ExchangeResult(
         session_id=code,
-        target=TargetCapability("http://target.internal", OLD_TOKEN),
+        target=TargetCapability(MANAGED_TARGET_URL, OLD_TOKEN),
         session_capability="finish-" + "f" * 40,
         expires_at=datetime.now(timezone.utc) + timedelta(minutes=10),
       )
@@ -64,7 +77,7 @@ def test_expiry_revokes_all_capabilities_and_history() -> None:
     def exchange(self, _code, _instance_id):
       return ExchangeResult(
         session_id="expiring",
-        target=TargetCapability("http://target.internal", OLD_TOKEN),
+        target=TargetCapability(MANAGED_TARGET_URL, OLD_TOKEN),
         session_capability="finish-" + "f" * 40,
         expires_at=datetime.now(timezone.utc) + timedelta(milliseconds=120),
       )
@@ -188,7 +201,7 @@ def test_launch_exchange_concurrency_is_capped() -> None:
       assert release.wait(5)
       return ExchangeResult(
         session_id=code,
-        target=TargetCapability("http://target.internal", OLD_TOKEN),
+        target=TargetCapability(MANAGED_TARGET_URL, OLD_TOKEN),
         session_capability="finish-" + "f" * 40,
         expires_at=datetime.now(timezone.utc) + timedelta(minutes=10),
       )
@@ -253,8 +266,9 @@ def test_normal_boot_failure_atomically_resumes_session() -> None:
     if request.url.path == "/recovery/exchange":
       return httpx.Response(200, json={
         "session_id": "session-1",
-        "target_url": "http://old-target.internal",
+        "target_url": MANAGED_TARGET_URL,
         "target_token": OLD_TOKEN,
+        "target_token_sha256": _target_token_sha256(OLD_TOKEN),
         "session_capability": "finish-" + "f" * 40,
         "expires_at": expiry,
       })
@@ -269,6 +283,7 @@ def test_normal_boot_failure_atomically_resumes_session() -> None:
         "session_id": "session-1",
         "status": "queued",
         "outcome": "recovered",
+        "generation": 1,
         "status_url": "/recovery/finish/finish_job-1",
       })
     assert request.headers["authorization"].startswith("Bearer finish-")
@@ -278,9 +293,12 @@ def test_normal_boot_failure_atomically_resumes_session() -> None:
       "session_id": "session-1",
       "status": "resumed",
       "outcome": "recovered",
+      "generation": 1,
       "status_url": "/recovery/finish/finish_job-1",
-      "target_url": "http://new-target.internal",
+      "next_generation": 2,
+      "target_url": MANAGED_TARGET_URL,
       "target_token": NEW_TOKEN,
+      "target_token_sha256": _target_token_sha256(NEW_TOKEN),
       "expires_at": expiry,
     })
 
@@ -296,7 +314,11 @@ def test_normal_boot_failure_atomically_resumes_session() -> None:
     local_target_token=None,
     local_token=None,
   )
-  control = ControlClient(settings, transport=httpx.MockTransport(handler))
+  control = ControlClient(
+    settings,
+    target_validator=_validate_managed_target,
+    transport=httpx.MockTransport(handler),
+  )
   assert control._client._trust_env is False
   store = SessionStore(
     local_token=None,
@@ -315,16 +337,20 @@ def test_normal_boot_failure_atomically_resumes_session() -> None:
   assert original_target.base_url == ""
   assert original_target.token == ""
   resumed = store.poll_finish(browser)
-  assert resumed == {"status": "resumed", "outcome": "recovered"}
+  assert resumed == {
+    "status": "resumed", "outcome": "recovered", "generation": 2
+  }
   assert store.get(browser) is session
   assert not session.finishing
-  assert session.target.base_url == "http://new-target.internal"
+  assert session.target.base_url == MANAGED_TARGET_URL
   assert session.target.token == NEW_TOKEN
   assert session.managed_exchange.session_capability == finish_capability
   stale = store._apply_finish_result(
     store._digest(browser), session, stale_pending
   )
-  assert stale == {"status": "resumed", "outcome": "recovered"}
+  assert stale == {
+    "status": "resumed", "outcome": "recovered", "generation": 2
+  }
   assert session.target.token == NEW_TOKEN
   assert not session.finishing
   assert calls == 4
@@ -333,7 +359,7 @@ def test_normal_boot_failure_atomically_resumes_session() -> None:
 def test_expired_session_cannot_be_resurrected_by_fresh_finish_target() -> None:
   exchange = ExchangeResult(
     session_id="expired-finish",
-    target=TargetCapability("http://old-target.internal", OLD_TOKEN),
+    target=TargetCapability(MANAGED_TARGET_URL, OLD_TOKEN),
     session_capability="finish-" + "f" * 40,
     expires_at=datetime.now(timezone.utc) + timedelta(minutes=10),
   )
@@ -348,6 +374,7 @@ def test_expired_session_cannot_be_resurrected_by_fresh_finish_target() -> None:
       session_id=exchange.session_id,
       status="queued",
       outcome="recovered",
+      generation=1,
       status_url="/recovery/finish/finish_expired-1",
     ),
   )
@@ -363,13 +390,15 @@ def test_expired_session_cannot_be_resurrected_by_fresh_finish_target() -> None:
     store._sessions[digest] = session
     store._schedule_expiry_locked()
   store.close()
-  fresh_target = TargetCapability("http://new-target.internal", NEW_TOKEN)
+  fresh_target = TargetCapability(MANAGED_TARGET_URL, NEW_TOKEN)
   resumed = FinishResult(
     finish_id="finish_expired-1",
     session_id=exchange.session_id,
     status="resumed",
     outcome="recovered",
+    generation=1,
     status_url="/recovery/finish/finish_expired-1",
+    next_generation=2,
     target=fresh_target,
     expires_at=datetime.now(timezone.utc) + timedelta(minutes=10),
     error_code="normal_boot_failed",
@@ -396,8 +425,9 @@ def test_managed_exchange_body_and_code_replay() -> None:
       })
     return httpx.Response(200, json={
       "session_id": "session-2",
-      "target_url": "http://target.internal",
+      "target_url": MANAGED_TARGET_URL,
       "target_token": OLD_TOKEN,
+      "target_token_sha256": _target_token_sha256(OLD_TOKEN),
       "session_capability": "finish-" + "f" * 40,
       "expires_at": expiry,
     })
@@ -414,7 +444,11 @@ def test_managed_exchange_body_and_code_replay() -> None:
     local_target_token=None,
     local_token=None,
   )
-  control = ControlClient(settings, transport=httpx.MockTransport(handler))
+  control = ControlClient(
+    settings,
+    target_validator=_validate_managed_target,
+    transport=httpx.MockTransport(handler),
+  )
   store = SessionStore(
     local_token=None,
     local_target=None,
@@ -452,6 +486,7 @@ def test_control_response_is_stream_bounded() -> None:
   )
   control = ControlClient(
     settings,
+    target_validator=_validate_managed_target,
     transport=httpx.MockTransport(
       lambda _request: httpx.Response(
         200,
@@ -477,8 +512,9 @@ def test_exchange_retries_exact_request_after_committed_response_is_lost(
       raise httpx.ReadTimeout("response lost after commit", request=request)
     return httpx.Response(200, json={
       "session_id": "durable-receipt",
-      "target_url": "http://target.internal",
+      "target_url": MANAGED_TARGET_URL,
       "target_token": OLD_TOKEN,
+      "target_token_sha256": _target_token_sha256(OLD_TOKEN),
       "session_capability": "finish-" + "f" * 40,
       "expires_at": expiry,
     })
@@ -495,7 +531,11 @@ def test_exchange_retries_exact_request_after_committed_response_is_lost(
     local_target_token=None,
     local_token=None,
   )
-  control = ControlClient(settings, transport=httpx.MockTransport(handler))
+  control = ControlClient(
+    settings,
+    target_validator=_validate_managed_target,
+    transport=httpx.MockTransport(handler),
+  )
   result = control.exchange("same-one-time-code", "mob_instance-1")
   assert result.session_id == "durable-receipt"
   assert len(requests) == 2
@@ -526,10 +566,14 @@ def test_exchange_ack_retries_exact_request_after_response_loss(monkeypatch) -> 
     local_target_token=None,
     local_token=None,
   )
-  control = ControlClient(settings, transport=httpx.MockTransport(handler))
+  control = ControlClient(
+    settings,
+    target_validator=_validate_managed_target,
+    transport=httpx.MockTransport(handler),
+  )
   result = ExchangeResult(
     session_id="session-ack",
-    target=TargetCapability("http://target.internal", OLD_TOKEN),
+    target=TargetCapability(MANAGED_TARGET_URL, OLD_TOKEN),
     session_capability="finish-" + "f" * 40,
     expires_at=datetime.now(timezone.utc) + timedelta(minutes=10),
   )
@@ -554,6 +598,7 @@ def test_finish_start_retries_exact_idempotent_request_after_response_loss(
       "session_id": "session-finish",
       "status": "queued",
       "outcome": "recovered",
+      "generation": 1,
       "status_url": "/recovery/finish/finish_retry-1",
     })
 
@@ -569,15 +614,22 @@ def test_finish_start_retries_exact_idempotent_request_after_response_loss(
     local_target_token=None,
     local_token=None,
   )
-  control = ControlClient(settings, transport=httpx.MockTransport(handler))
+  control = ControlClient(
+    settings,
+    target_validator=_validate_managed_target,
+    transport=httpx.MockTransport(handler),
+  )
   exchange = ExchangeResult(
     session_id="session-finish",
-    target=TargetCapability("http://target.internal", OLD_TOKEN),
+    target=TargetCapability(MANAGED_TARGET_URL, OLD_TOKEN),
     session_capability="finish-" + "f" * 40,
     expires_at=datetime.now(timezone.utc) + timedelta(minutes=10),
   )
-  result = control.finish(exchange, "recovered")
+  result = control.finish(exchange, "recovered", 1)
   assert result.finish_id == "finish_retry-1"
   assert result.pending
   assert len(requests) == 2
   assert requests[0] == requests[1]
+  assert requests[0][0] == (
+    b'{"session_id":"session-finish","outcome":"recovered","generation":1}'
+  )

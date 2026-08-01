@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import threading
 import time
 from datetime import datetime, timedelta, timezone
@@ -22,6 +23,7 @@ from recovery_worker.sessions import RecoverySession
 
 LOCAL_CODE = "local-code-" + "c" * 32
 TARGET_TOKEN = "target-token-" + "t" * 32
+MANAGED_TARGET_URL = "http://mobius.railway.internal:18002"
 SAME_ORIGIN = {
   "Origin": "http://testserver",
   "Sec-Fetch-Site": "same-origin",
@@ -30,6 +32,16 @@ MANAGED_HANDOFF = {
   "Origin": "https://mobius.you",
   "Sec-Fetch-Site": "cross-site",
 }
+
+
+def _target_token_sha256(token: str) -> str:
+  return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+
+def _record_managed_preflight(app) -> None:
+  app.state.preflight_bindings.record(
+    TargetCapability(MANAGED_TARGET_URL, TARGET_TOKEN)
+  )
 
 
 def local_settings() -> Settings:
@@ -185,8 +197,9 @@ def test_managed_launch_accepts_only_exact_control_plane_handoff(tmp_path) -> No
       })
     return httpx.Response(200, json={
       "session_id": "managed-origin",
-      "target_url": "http://target.internal",
+      "target_url": MANAGED_TARGET_URL,
       "target_token": TARGET_TOKEN,
+      "target_token_sha256": _target_token_sha256(TARGET_TOKEN),
       "session_capability": "finish-" + "f" * 40,
       "expires_at": expiry,
     })
@@ -209,6 +222,7 @@ def test_managed_launch_accepts_only_exact_control_plane_handoff(tmp_path) -> No
     target_transport=httpx.MockTransport(target),
     broker_path=tmp_path / "managed" / "target.sock",
   )
+  _record_managed_preflight(app)
   body = {"code": "managed-code", "instance_id": "mob_instance-1"}
   with TestClient(app, base_url="https://recovery.example") as client:
     assert client.post("/session/start", data=body).status_code == 403
@@ -351,8 +365,9 @@ def test_consumed_managed_grant_keeps_secure_session_when_target_wakes(tmp_path)
     assert request.url.path == "/recovery/exchange"
     return httpx.Response(200, json={
       "session_id": "managed-session",
-      "target_url": "http://target.internal",
+      "target_url": MANAGED_TARGET_URL,
       "target_token": TARGET_TOKEN,
+      "target_token_sha256": _target_token_sha256(TARGET_TOKEN),
       "session_capability": "finish-" + "f" * 40,
       "expires_at": expiry,
     })
@@ -378,6 +393,7 @@ def test_consumed_managed_grant_keeps_secure_session_when_target_wakes(tmp_path)
     target_transport=unavailable,
     broker_path=tmp_path / "broker" / "target.sock",
   )
+  _record_managed_preflight(app)
   with TestClient(app, base_url="https://recovery.example") as client:
     started = client.post(
       "/session/start",
@@ -430,11 +446,20 @@ def test_finish_is_rejected_while_recovery_stream_owns_turn(tmp_path) -> None:
     broker_path=tmp_path / "broker" / "target.sock",
   )
   with TestClient(app) as client:
-    client.post("/session/start", data={"code": LOCAL_CODE}, headers=SAME_ORIGIN)
+    started = client.post(
+      "/session/start", data={"code": LOCAL_CODE}, headers=SAME_ORIGIN
+    )
+    assert "const initialGeneration=1;" in started.text
+    missing_generation = client.post(
+      "/api/finish", headers=SAME_ORIGIN, json={"outcome": "recovered"}
+    )
+    assert missing_generation.status_code == 400
+    assert missing_generation.json()["error"]["code"] == "invalid_generation"
     assert _claim() is True
     try:
       response = client.post(
-        "/api/finish", headers=SAME_ORIGIN, json={"outcome": "recovered"}
+        "/api/finish", headers=SAME_ORIGIN,
+        json={"outcome": "recovered", "generation": 1}
       )
       assert response.status_code == 409
       assert response.json()["error"]["code"] == "turn_active"
@@ -455,8 +480,9 @@ def test_managed_finish_freezes_target_and_survives_reload_and_poll_loss(
     if request.url.path == "/recovery/exchange":
       return httpx.Response(200, json={
         "session_id": "managed-finish-session",
-        "target_url": "http://target.internal",
+        "target_url": MANAGED_TARGET_URL,
         "target_token": TARGET_TOKEN,
+        "target_token_sha256": _target_token_sha256(TARGET_TOKEN),
         "session_capability": "finish-" + "f" * 40,
         "expires_at": expiry,
       })
@@ -470,6 +496,7 @@ def test_managed_finish_freezes_target_and_survives_reload_and_poll_loss(
         "session_id": "managed-finish-session",
         "status": "queued",
         "outcome": "recovered",
+        "generation": 1,
         "status_url": "/recovery/finish/finish_managed-1",
       })
     status_calls += 1
@@ -480,6 +507,7 @@ def test_managed_finish_freezes_target_and_survives_reload_and_poll_loss(
       "session_id": "managed-finish-session",
       "status": "finished",
       "outcome": "recovered",
+      "generation": 1,
       "status_url": "/recovery/finish/finish_managed-1",
     })
 
@@ -507,6 +535,7 @@ def test_managed_finish_freezes_target_and_survives_reload_and_poll_loss(
     target_transport=httpx.MockTransport(counted_target),
     broker_path=broker_path,
   )
+  _record_managed_preflight(app)
   with TestClient(app, base_url="https://recovery.example") as client:
     started = client.post(
       "/session/start",
@@ -522,7 +551,7 @@ def test_managed_finish_freezes_target_and_survives_reload_and_poll_loss(
         "Origin": "https://recovery.example",
         "Sec-Fetch-Site": "same-origin",
       },
-      json={"outcome": "recovered"},
+      json={"outcome": "recovered", "generation": 1},
     )
     assert accepted.status_code == 202
     assert accepted.json()["status"] == "queued"
@@ -569,7 +598,8 @@ def test_local_finish_lands_on_closed_state_with_launcher_instruction(tmp_path) 
   with TestClient(app) as client:
     client.post("/session/start", data={"code": LOCAL_CODE}, headers=SAME_ORIGIN)
     finished = client.post(
-      "/api/finish", headers=SAME_ORIGIN, json={"outcome": "recovered"}
+      "/api/finish", headers=SAME_ORIGIN,
+      json={"outcome": "recovered", "generation": 1}
     )
     assert finished.status_code == 200
     page = client.get("/")
@@ -611,8 +641,9 @@ def test_health_stays_responsive_during_slow_sync_integrations(tmp_path) -> None
         slow()
         return httpx.Response(200, json={
           "session_id": "managed-session",
-          "target_url": "http://target.internal",
+          "target_url": MANAGED_TARGET_URL,
           "target_token": TARGET_TOKEN,
+          "target_token_sha256": _target_token_sha256(TARGET_TOKEN),
           "session_capability": "finish-" + "f" * 40,
           "expires_at": expiry,
         })
@@ -635,6 +666,7 @@ def test_health_stays_responsive_during_slow_sync_integrations(tmp_path) -> None
         target_transport=httpx.MockTransport(target),
         broker_path=tmp_path / kind / "target.sock",
       )
+      _record_managed_preflight(app)
       launch = {"code": "managed-code", "instance_id": "mob_instance-1"}
     else:
       def target_transport(request: httpx.Request) -> httpx.Response:

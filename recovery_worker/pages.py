@@ -163,6 +163,7 @@ def recovery_page(
   protocol_version: str,
   build_sha: str,
   session_id: str,
+  generation: int,
   readiness_error: str | None = None,
   finishing: bool = False,
   finish_result=None,
@@ -202,6 +203,9 @@ def recovery_page(
   script = _SCRIPT.replace(
     "const initialFinishing=false;",
     f"const initialFinishing={'true' if finishing else 'false'};",
+  ).replace(
+    "const initialGeneration=1;",
+    f"const initialGeneration={generation};",
   )
   return _document("Repair · Mobius Recovery", body, nonce, script)
 
@@ -210,6 +214,7 @@ _SCRIPT = r"""
 history.replaceState(null,'','/');
 const $=s=>document.querySelector(s), messages=$('#messages'), empty=$('#empty');
 const initialFinishing=false;
+const initialGeneration=1;
 let busy=false,finishing=initialFinishing,finishTimer;
 function setBusy(value){busy=value;const disabled=value||finishing;$('#send').disabled=disabled;$('#message').disabled=disabled;$('#finish').disabled=disabled;$('#cancel').disabled=disabled;
  $('#finish').title=value?'Wait for the active recovery turn to finish.':'';$('#cancel').title=$('#finish').title}
@@ -257,7 +262,7 @@ function handleFinish(data){if(data.status==='finished'){location.replace('/');r
  clearTimeout(finishTimer);finishTimer=setTimeout(pollFinish,1200)}
 async function pollFinish(){if(!finishing)return;try{handleFinish(await api('/api/finish/status'))}catch(e){if(redirectLost(e))return;
  $('#target-status').textContent='Still waiting for finish status · '+e.message;finishTimer=setTimeout(pollFinish,1800)}}
-async function finish(outcome){enterFinishing();try{handleFinish(await api('/api/finish',{method:'POST',body:JSON.stringify({outcome})}))}
+async function finish(outcome){enterFinishing();try{handleFinish(await api('/api/finish',{method:'POST',body:JSON.stringify({outcome,generation:initialGeneration})}))}
  catch(e){if(redirectLost(e))return;if(e.status&&e.status<500){finishing=false;setBusy(false);alert(e.message)}else{
  $('#target-status').textContent='Confirming finish status…';finishTimer=setTimeout(pollFinish,1200)}}}
 $('[data-finish-confirm]').onclick=()=>finish('recovered');$('#cancel').onclick=()=>{if(confirm('Cancel this recovery session?'))finish('cancelled')};

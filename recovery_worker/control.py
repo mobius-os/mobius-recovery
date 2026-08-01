@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime
 from urllib.parse import urlparse
@@ -36,7 +37,9 @@ class FinishResult:
   session_id: str
   status: str
   outcome: str
+  generation: int
   status_url: str
+  next_generation: int | None = None
   target: TargetCapability | None = None
   expires_at: datetime | None = None
   error_code: str | None = None
@@ -54,11 +57,13 @@ class ControlClient:
     self,
     settings: Settings,
     *,
+    target_validator: Callable[[TargetCapability, object], None],
     transport: httpx.BaseTransport | None = None,
   ) -> None:
     if not settings.managed:
       raise ValueError("control client requires managed mode")
     self._settings = settings
+    self._target_validator = target_validator
     self._client = httpx.Client(
       base_url=settings.control_plane_url,
       timeout=httpx.Timeout(20.0, connect=8.0),
@@ -200,24 +205,29 @@ class ControlClient:
       raise ProtocolError("invalid_exchange", "session id is missing")
     if not isinstance(capability, str) or len(capability) < 32:
       raise ProtocolError("invalid_exchange", "session capability is missing")
+    target = TargetCapability.parse(data.get("target_url"), data.get("target_token"))
+    expires_at = parse_expiry(data.get("expires_at"))
+    self._target_validator(target, data.get("target_token_sha256"))
     return ExchangeResult(
       session_id=session_id,
-      target=TargetCapability.parse(data.get("target_url"), data.get("target_token")),
+      target=target,
       session_capability=capability,
-      expires_at=parse_expiry(data.get("expires_at")),
+      expires_at=expires_at,
     )
 
-  @staticmethod
   def _parse_finish(
+    self,
     http_status: int,
     data: dict,
     exchange: ExchangeResult,
     expected_outcome: str,
+    expected_generation: int,
   ) -> FinishResult:
     finish_id = data.get("finish_id")
     session_id = data.get("session_id")
     status = data.get("status")
     outcome = data.get("outcome")
+    generation = data.get("generation")
     status_url = data.get("status_url")
     if (
       not isinstance(finish_id, str)
@@ -225,6 +235,9 @@ class ControlClient:
       or any(char not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-" for char in finish_id)
       or session_id != exchange.session_id
       or outcome != expected_outcome
+      or isinstance(generation, bool)
+      or not isinstance(generation, int)
+      or generation != expected_generation
       or status not in {"queued", "running", "finished", "resumed", "failed"}
       or not isinstance(status_url, str)
     ):
@@ -250,6 +263,7 @@ class ControlClient:
     error_message = None
     target = None
     expires_at = None
+    next_generation = None
     if http_status == 503:
       error = data.get("error")
       if not isinstance(error, dict):
@@ -263,32 +277,68 @@ class ControlClient:
           raise ProtocolError(
             "invalid_control_response", "finish resume status is invalid"
           )
+        next_generation = data.get("next_generation")
+        if (
+          isinstance(next_generation, bool)
+          or next_generation != generation + 1
+        ):
+          raise ProtocolError(
+            "invalid_control_response", "finish next generation is invalid"
+          )
         target = TargetCapability.parse(
           data.get("target_url"), data.get("target_token")
         )
         expires_at = parse_expiry(data.get("expires_at"))
+        self._target_validator(target, data.get("target_token_sha256"))
       elif status == "resumed":
         raise ProtocolError(
           "invalid_control_response", "finish resume result is invalid"
         )
+    if status != "resumed" and any(
+      field in data
+      for field in (
+        "target_url", "target_token", "target_token_sha256",
+        "expires_at", "next_generation",
+      )
+    ):
+      raise ProtocolError(
+        "invalid_control_response", "finish result contains unexpected target access"
+      )
     return FinishResult(
       finish_id=finish_id,
       session_id=session_id,
       status=status,
       outcome=outcome,
+      generation=generation,
       status_url=status_url,
+      next_generation=next_generation,
       target=target,
       expires_at=expires_at,
       error_code=error_code,
       error_message=error_message,
     )
 
-  def finish(self, result: ExchangeResult, outcome: str) -> FinishResult:
+  def finish(
+    self,
+    result: ExchangeResult,
+    outcome: str,
+    generation: int,
+  ) -> FinishResult:
     if outcome not in {"recovered", "cancelled"}:
       raise ProtocolError("invalid_outcome", "invalid recovery outcome", 400)
+    if (
+      isinstance(generation, bool)
+      or not isinstance(generation, int)
+      or generation < 1
+    ):
+      raise ProtocolError("invalid_generation", "invalid finish generation", 400)
     status, data = self._post_json(
       "/recovery/finish",
-      {"session_id": result.session_id, "outcome": outcome},
+      {
+        "session_id": result.session_id,
+        "outcome": outcome,
+        "generation": generation,
+      },
       headers={"Authorization": f"Bearer {result.session_capability}"},
       retry_transport_once=True,
     )
@@ -300,7 +350,7 @@ class ControlClient:
         else "Could not finish the recovery session."
       )
       raise ProtocolError("finish_rejected", message[:500], status)
-    return self._parse_finish(status, data, result, outcome)
+    return self._parse_finish(status, data, result, outcome, generation)
 
   def poll_finish(
     self,
@@ -320,7 +370,9 @@ class ControlClient:
         else "Could not read recovery finish status."
       )
       raise ProtocolError("finish_status_rejected", message[:500], status)
-    parsed = self._parse_finish(status, data, exchange, finish.outcome)
+    parsed = self._parse_finish(
+      status, data, exchange, finish.outcome, finish.generation
+    )
     if parsed.finish_id != finish.finish_id:
       raise ProtocolError("invalid_control_response", "finish id changed")
     return parsed

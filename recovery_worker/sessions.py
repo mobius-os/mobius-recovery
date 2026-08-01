@@ -10,6 +10,7 @@ import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 from .control import ControlClient, ExchangeResult, FinishResult
 from .protocol import ProtocolError, TargetCapability
@@ -41,7 +42,10 @@ class RecoverySession:
   readiness_error: str | None = None
   finish_outcome: str | None = None
   finish_result: FinishResult | None = None
+  finish_generation: int = 1
+  resume_outcome: str | None = None
   provider_generation: int | None = None
+  workspace: Path | None = None
   _history_chars: int = field(default=0, init=False, repr=False)
   _messages_lock: threading.Lock = field(
     default_factory=threading.Lock, init=False, repr=False
@@ -85,6 +89,11 @@ class RecoverySession:
     with self._finish_lock:
       return self.finish_outcome is not None
 
+  @property
+  def generation(self) -> int:
+    with self._finish_lock:
+      return self.finish_generation
+
   def revoke(self) -> None:
     """Clears every target/control capability and retained conversation."""
     with self._revoke_lock:
@@ -124,6 +133,7 @@ class SessionStore:
     on_revoke: Callable[[RecoverySession, str], None] | None = None,
     on_resume: Callable[[RecoverySession], None] | None = None,
     on_finish_accepted: Callable[[RecoverySession], None] | None = None,
+    on_finish_released: Callable[[], None] | None = None,
   ) -> None:
     self._local_token = local_token
     self._local_target = local_target
@@ -132,6 +142,7 @@ class SessionStore:
     self._on_revoke = on_revoke
     self._on_resume = on_resume
     self._on_finish_accepted = on_finish_accepted
+    self._on_finish_released = on_finish_released
     self._sessions: dict[str, RecoverySession] = {}
     self._used_codes: set[str] = set()
     self._starting_codes: set[str] = set()
@@ -314,7 +325,10 @@ class SessionStore:
   ) -> dict:
     payload = {
       "status": result.status if result else "queued",
-      "outcome": session.finish_outcome,
+      "outcome": session.finish_outcome or (result.outcome if result else None),
+      # The browser observes the session generation, never the generation of a
+      # response object that may have become stale while runtime resume ran.
+      "generation": session.finish_generation,
     }
     if result and result.finish_id:
       payload["finish_id"] = result.finish_id
@@ -324,6 +338,94 @@ class SessionStore:
         "message": result.error_message or "Recovery could not be finished.",
       }
     return payload
+
+  @staticmethod
+  def _discard_result_target(
+    session: RecoverySession,
+    result: FinishResult,
+  ) -> None:
+    if result.target is not None and result.target is not session.target:
+      result.target.clear()
+
+  def _stale_finish_payload_locked(
+    self,
+    session: RecoverySession,
+    result: FinishResult,
+  ) -> dict:
+    self._discard_result_target(session, result)
+    current = session.finish_result
+    if current and current.generation == session.finish_generation:
+      return self._finish_payload(session, current)
+    return {
+      "status": (
+        "resumed"
+        if result.generation < session.finish_generation
+        else "queued" if session.finish_outcome else "resumed"
+      ),
+      "outcome": session.finish_outcome or result.outcome,
+      "generation": session.finish_generation,
+    }
+
+  def _generation_payload_locked(
+    self,
+    session: RecoverySession,
+    outcome: str,
+    requested_generation: int,
+  ) -> dict:
+    current = session.finish_result
+    if current and current.generation == session.finish_generation:
+      return self._finish_payload(session, current)
+    return {
+      "status": (
+        "resumed"
+        if requested_generation < session.finish_generation
+        else "queued"
+      ),
+      "outcome": session.finish_outcome or outcome,
+      "generation": session.finish_generation,
+    }
+
+  def _fail_finish_closed(
+    self,
+    session: RecoverySession,
+    outcome: str,
+    generation: int,
+    exc: Exception,
+  ) -> dict:
+    message = (
+      exc.message if isinstance(exc, ProtocolError)
+      else "The local recovery boundary could not close cleanly."
+    )
+    failure = FinishResult(
+      finish_id=f"local_failure_{generation}",
+      session_id=session.session_id,
+      status="failed",
+      outcome=outcome,
+      generation=generation,
+      status_url="",
+      error_code=(
+        exc.code if isinstance(exc, ProtocolError) else "finish_failed_closed"
+      ),
+      error_message=(
+        f"{message} Target access remains closed; open Recovery again."
+      )[:1000],
+    )
+    with session._finish_lock:
+      if (
+        session.finish_generation != generation
+        or session.finish_outcome != outcome
+      ):
+        return self._stale_finish_payload_locked(session, failure)
+      current = session.finish_result
+      if (
+        current
+        and current.generation == generation
+        and not current.pending
+      ):
+        return self._finish_payload(session, current)
+      session.finish_result = failure
+      session._finish_quiesced = True
+      return self._finish_payload(session, failure)
 
   def _quiesce_finish(self, session: RecoverySession, outcome: str) -> None:
     with session._finish_lock:
@@ -336,6 +438,7 @@ class SessionStore:
       if session._finish_quiesced:
         return
       session.finish_outcome = outcome
+      session.resume_outcome = None
     try:
       if self._on_finish_accepted:
         self._on_finish_accepted(session)
@@ -353,20 +456,22 @@ class SessionStore:
     result: FinishResult,
   ) -> dict:
     with session._finish_lock:
-      if session.finish_outcome != result.outcome:
-        # A concurrent terminal normal-boot failure already resumed the
-        # session; a slower pending response must not put it back into finish.
-        if result.target:
-          result.target.clear()
-        return {"status": "resumed", "outcome": result.outcome}
+      if (
+        result.generation != session.finish_generation
+        or session.finish_outcome != result.outcome
+      ):
+        # A response from an older finish generation must never regress a
+        # resumed target or the next finish attempt.
+        return self._stale_finish_payload_locked(session, result)
       current = session.finish_result
-      if current and current.finish_id != result.finish_id:
-        if result.target:
-          result.target.clear()
+      if current and (
+        current.generation != result.generation
+        or current.finish_id != result.finish_id
+      ):
+        self._discard_result_target(session, result)
         raise ProtocolError("invalid_control_response", "finish id changed")
       if current and not current.pending:
-        if result.target:
-          result.target.clear()
+        self._discard_result_target(session, result)
         return self._finish_payload(session, current)
       session.finish_result = result
     if result.pending:
@@ -379,9 +484,11 @@ class SessionStore:
         self._revoke(session, "finished")
       return self._finish_payload(session, result)
     if (
-      result.error_code == "normal_boot_failed"
+      result.status == "resumed"
+      and result.error_code == "normal_boot_failed"
       and result.target is not None
       and result.expires_at is not None
+      and result.next_generation == result.generation + 1
     ):
       with self._lock:
         if self._sessions.get(digest) is not session or session.revoked:
@@ -395,58 +502,111 @@ class SessionStore:
           assert session.managed_exchange is not None
           session.managed_exchange.target = result.target
           session.managed_exchange.expires_at = result.expires_at
-          session.finish_outcome = None
-          session.finish_result = None
-          session._finish_quiesced = False
+          session.finish_generation = result.next_generation
         self._schedule_expiry_locked()
       if self._on_resume:
         try:
           self._on_resume(session)
           session.readiness_error = None
-        except (OSError, ProtocolError):
+        except (OSError, ProtocolError) as exc:
+          session.target.clear()
+          assert session.managed_exchange is not None
+          session.managed_exchange.target.clear()
           session.readiness_error = "The local target broker could not start."
-      return {"status": "resumed", "outcome": result.outcome}
+          return self._fail_finish_closed(
+            session, result.outcome, result.next_generation, exc
+          )
+      with session._finish_lock:
+        if (
+          session.finish_generation != result.next_generation
+          or session.finish_result is not result
+        ):
+          return self._stale_finish_payload_locked(session, result)
+        session.finish_outcome = None
+        session.finish_result = None
+        session._finish_quiesced = False
+        session.resume_outcome = result.outcome
+      if self._on_finish_released:
+        self._on_finish_released()
+      return {
+        "status": "resumed",
+        "outcome": result.outcome,
+        "generation": result.next_generation,
+      }
     return self._finish_payload(session, result)
 
-  def begin_finish(self, browser_token: str, outcome: str) -> dict:
+  def begin_finish(
+    self,
+    browser_token: str,
+    outcome: str,
+    expected_generation: int | None = None,
+  ) -> dict:
     if outcome not in {"recovered", "cancelled"}:
       raise ProtocolError("invalid_outcome", "invalid recovery outcome", 400)
+    if expected_generation is not None and (
+      isinstance(expected_generation, bool)
+      or not isinstance(expected_generation, int)
+      or expected_generation < 1
+    ):
+      raise ProtocolError("invalid_generation", "invalid finish generation", 400)
     digest = self._digest(browser_token)
     with self._lock:
       session = self._sessions.get(digest)
     if session is None:
       raise ProtocolError("auth_failed", "Recovery session expired.", 401)
+    with session._finish_lock:
+      if (
+        expected_generation is not None
+        and expected_generation != session.finish_generation
+      ):
+        return self._generation_payload_locked(
+          session, outcome, expected_generation
+        )
     if not session.managed_exchange or not self._control:
       with self._lock:
         removed = self._sessions.pop(digest, None)
         self._schedule_expiry_locked()
       if removed:
         self._revoke(session, "finished")
-      return {"status": "finished", "outcome": outcome}
-
+      return {
+        "status": "finished",
+        "outcome": outcome,
+        "generation": session.finish_generation,
+      }
+    try:
+      self._quiesce_finish(session, outcome)
+    except Exception as exc:
+      return self._fail_finish_closed(
+        session, outcome, session.finish_generation, exc
+      )
     with session._finish_lock:
-      if session.finish_outcome and session.finish_outcome != outcome:
-        raise ProtocolError(
-          "finish_outcome_conflict",
-          "Recovery is already finishing with a different outcome.",
-          409,
+      generation = session.finish_generation
+      if (
+        expected_generation is not None
+        and expected_generation != generation
+      ):
+        return self._generation_payload_locked(
+          session, outcome, expected_generation
         )
       existing = session.finish_result
       if existing and not existing.pending:
         return self._finish_payload(session, existing)
 
     try:
-      result = self._control.finish(session.managed_exchange, outcome)
+      result = self._control.finish(
+        session.managed_exchange, outcome, generation
+      )
     except ProtocolError as exc:
-      if exc.code not in {"control_timeout", "control_unreachable"}:
-        raise
-      # A lost response may follow a committed 202. Freeze the target and let
-      # the same idempotent POST recover the durable job on the next poll.
-      self._quiesce_finish(session, outcome)
-      return self._finish_payload(session, None)
+      if exc.code in {"control_timeout", "control_unreachable"}:
+        # A lost response may follow a committed 202. The session was already
+        # quiesced, so the same generation can be posted idempotently later.
+        return self._finish_payload(session, None)
+      return self._fail_finish_closed(session, outcome, generation, exc)
 
-    self._quiesce_finish(session, outcome)
-    return self._apply_finish_result(digest, session, result)
+    try:
+      return self._apply_finish_result(digest, session, result)
+    except ProtocolError as exc:
+      return self._fail_finish_closed(session, outcome, generation, exc)
 
   def poll_finish(self, browser_token: str) -> dict:
     digest = self._digest(browser_token)
@@ -457,8 +617,22 @@ class SessionStore:
     with session._finish_lock:
       outcome = session.finish_outcome
       existing = session.finish_result
+      generation = session.finish_generation
+      resume_outcome = session.resume_outcome
     if not outcome:
+      if resume_outcome:
+        return {
+          "status": "resumed",
+          "outcome": resume_outcome,
+          "generation": generation,
+        }
       raise ProtocolError("finish_not_started", "Recovery is not finishing.", 409)
+    if existing and existing.generation != generation:
+      return {
+        "status": "running",
+        "outcome": outcome,
+        "generation": generation,
+      }
     if existing and not existing.pending:
       return self._finish_payload(session, existing)
     if existing is None:
@@ -469,8 +643,15 @@ class SessionStore:
     except ProtocolError as exc:
       if exc.code in {"control_timeout", "control_unreachable"}:
         return self._finish_payload(session, existing)
-      raise
-    return self._apply_finish_result(digest, session, result)
+      return self._fail_finish_closed(
+        session, outcome, existing.generation, exc
+      )
+    try:
+      return self._apply_finish_result(digest, session, result)
+    except ProtocolError as exc:
+      return self._fail_finish_closed(
+        session, outcome, existing.generation, exc
+      )
 
   def finish(self, browser_token: str, outcome: str) -> dict:
     """Backward-compatible name for the non-blocking finish start."""

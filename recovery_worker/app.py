@@ -9,6 +9,7 @@ import secrets
 import threading
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
+from pathlib import Path
 from urllib.parse import parse_qs
 from urllib.parse import urlparse
 
@@ -16,16 +17,24 @@ import httpx
 from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 
-from .chat import claim_finish, release_finish, stream_turn, turn_active
+from .chat import (
+  claim_finish,
+  finish_active,
+  release_finish,
+  stream_turn,
+  turn_active,
+)
 from .broker import BROKER_SOCKET, TargetBroker
 from .config import WORKER_PROTOCOL_VERSION, Settings
 from .control import ControlClient
 from .pages import closed_page, login_page, lost_page, recovery_page
+from .preflight import PreflightBindings, managed_target_url
 from .protocol import ProtocolError, TargetCapability
 from .providers import ProviderAuth
 from .security import harden_process
 from .sessions import COOKIE_NAME, RecoverySession, SessionStore
 from .target_client import TargetClient
+from .workspace import SessionWorkspaces, WORKSPACES_DIR
 
 
 MAX_API_BODY = 64 * 1024
@@ -49,8 +58,18 @@ def _target_health(
 class RecoveryRuntime:
   """Serializes broker/provider ownership for the one active session."""
 
-  def __init__(self, providers: ProviderAuth, *, target_transport, broker_path) -> None:
+  def __init__(
+    self,
+    providers: ProviderAuth,
+    workspaces: SessionWorkspaces,
+    preflight: PreflightBindings,
+    *,
+    target_transport,
+    broker_path,
+  ) -> None:
     self._providers = providers
+    self._workspaces = workspaces
+    self._preflight = preflight
     self._target_transport = target_transport
     self._broker_path = broker_path or BROKER_SOCKET
     self._active: tuple[str, TargetBroker] | None = None
@@ -65,7 +84,13 @@ class RecoveryRuntime:
     if sessions:
       sessions.expire()
 
-  def activate(self, session: RecoverySession, *, clear_providers: bool = True) -> None:
+  def activate(
+    self,
+    session: RecoverySession,
+    *,
+    clear_providers: bool = True,
+    release_gate: bool = True,
+  ) -> None:
     if session.revoked or session.expires_at <= datetime.now(timezone.utc):
       raise ProtocolError("auth_expired", "Recovery session expired.", 401)
     with self._lock:
@@ -78,6 +103,7 @@ class RecoveryRuntime:
         self._providers.clear()
       broker = None
       try:
+        session.workspace = self._workspaces.create()
         session.provider_generation = self._providers.enable()
         broker = TargetBroker(
           session.target,
@@ -90,16 +116,27 @@ class RecoveryRuntime:
         if session.revoked or session.expires_at <= datetime.now(timezone.utc):
           raise ProtocolError("auth_expired", "Recovery session expired.", 401)
         self._active = (session.session_id, broker)
+        self._preflight.clear()
+        if release_gate:
+          release_finish()
       except Exception:
         if broker:
           broker.stop()
         self._providers.clear()
+        self._workspaces.clear()
+        self._preflight.clear()
         session.provider_generation = None
+        session.workspace = None
         raise
 
-  def revoke(self, session: RecoverySession, _reason: str) -> None:
+  def revoke(self, session: RecoverySession, reason: str) -> None:
     with self._lock:
       session.provider_generation = None
+      session.workspace = None
+      if self._active and self._active[0] != session.session_id:
+        # Delayed expiry/replacement cleanup from an older session must not
+        # erase the process-global state now owned by a newer active session.
+        return
       active = None
       if self._active and self._active[0] == session.session_id:
         active = self._active[1]
@@ -108,10 +145,18 @@ class RecoveryRuntime:
         if active:
           active.stop()
       finally:
-        self._providers.clear()
+        try:
+          self._providers.clear()
+        finally:
+          try:
+            self._workspaces.clear()
+            self._preflight.clear()
+          finally:
+            if reason != "finishing":
+              release_finish()
 
   def resume(self, session: RecoverySession) -> None:
-    self.activate(session, clear_providers=False)
+    self.activate(session, clear_providers=False, release_gate=False)
 
   def quiesce(self, session: RecoverySession) -> None:
     """Stops every target-capable process while retaining poll capability."""
@@ -124,7 +169,12 @@ class RecoveryRuntime:
           self._active[1].stop()
           self._active = None
       finally:
-        self._providers.clear()
+        try:
+          self._providers.clear()
+        finally:
+          self._workspaces.clear()
+          self._preflight.clear()
+          release_finish()
 
 
 def _nonce() -> str:
@@ -276,12 +326,18 @@ def create_app(
   control_transport: httpx.BaseTransport | None = None,
   target_transport: httpx.BaseTransport | None = None,
   broker_path=None,
+  workspace_root=None,
 ) -> FastAPI:
   """Creates one worker app; injection points are test-only transports."""
   settings = settings or Settings.from_env()
   settings.validate()
+  preflight = PreflightBindings()
   control = (
-    ControlClient(settings, transport=control_transport)
+    ControlClient(
+      settings,
+      target_validator=preflight.consume,
+      transport=control_transport,
+    )
     if settings.managed else None
   )
   local_target = (
@@ -290,8 +346,19 @@ def create_app(
     )
   )
   providers = ProviderAuth()
+  resolved_workspace_root = (
+    Path(workspace_root)
+    if workspace_root is not None
+    else (
+      Path(broker_path).parent / "workspaces"
+      if broker_path is not None else WORKSPACES_DIR
+    )
+  )
+  workspaces = SessionWorkspaces(resolved_workspace_root)
   runtime = RecoveryRuntime(
     providers,
+    workspaces,
+    preflight,
     target_transport=target_transport,
     broker_path=broker_path,
   )
@@ -303,6 +370,7 @@ def create_app(
     on_revoke=runtime.revoke,
     on_resume=runtime.resume,
     on_finish_accepted=runtime.quiesce,
+    on_finish_released=release_finish,
   )
   runtime.bind_sessions(sessions)
 
@@ -326,6 +394,8 @@ def create_app(
   app.state.sessions = sessions
   app.state.providers = providers
   app.state.runtime = runtime
+  app.state.preflight_bindings = preflight
+  app.state.workspaces = workspaces
 
   @app.exception_handler(ProtocolError)
   async def protocol_error(_request: Request, exc: ProtocolError):
@@ -343,7 +413,7 @@ def create_app(
 
   async def interactive(request: Request) -> tuple[str, RecoverySession]:
     token, session = await current(request)
-    if session.finishing:
+    if session.finishing or finish_active():
       raise ProtocolError(
         "finish_in_progress",
         "Recovery is already finishing; target access is closed.",
@@ -408,24 +478,7 @@ def create_app(
         "target_url and target_token are required.",
         400,
       )
-    target_url = payload.get("target_url")
-    if not isinstance(target_url, str):
-      raise ProtocolError("invalid_target", "Managed target URL is invalid.", 400)
-    parsed = urlparse(target_url)
-    try:
-      target_port = parsed.port
-    except ValueError as exc:
-      raise ProtocolError(
-        "invalid_target", "Managed target URL is invalid.", 400
-      ) from exc
-    if (
-      parsed.scheme != "http"
-      or not parsed.hostname
-      or not parsed.hostname.endswith(".railway.internal")
-      or parsed.path not in {"", "/"}
-      or target_port != 18002
-    ):
-      raise ProtocolError("invalid_target", "Managed target URL is invalid.", 400)
+    target_url = managed_target_url(payload.get("target_url"))
     capability = TargetCapability.parse(target_url, payload.get("target_token"))
     result = await asyncio.to_thread(
       _target_health, capability, target_transport
@@ -436,6 +489,7 @@ def create_app(
         "Mobius target is not in recovery mode.",
         409,
       )
+    preflight.record(capability)
     response = {
       "status": "ok",
       "protocol": result["protocol"],
@@ -472,6 +526,7 @@ def create_app(
         protocol_version=WORKER_PROTOCOL_VERSION,
         build_sha=settings.build_sha,
         session_id=session.session_id,
+        generation=session.generation,
         readiness_error=session.readiness_error,
         finishing=session.finishing,
         finish_result=session.finish_result,
@@ -510,6 +565,7 @@ def create_app(
       protocol_version=WORKER_PROTOCOL_VERSION,
       build_sha=settings.build_sha,
       session_id=session.session_id,
+      generation=session.generation,
       readiness_error=session.readiness_error,
     )
     response = HTMLResponse(body, status_code=200)
@@ -609,7 +665,9 @@ def create_app(
       raise ProtocolError("invalid_request", "Message and provider are required.", 400)
 
     async def events():
-      iterator = stream_turn(message, provider, session, providers).__aiter__()
+      iterator = stream_turn(
+        message, provider, session, providers, workspaces
+      ).__aiter__()
       async for frame in _sse_events(iterator):
         yield frame
 
@@ -622,21 +680,48 @@ def create_app(
   @app.post("/api/finish")
   async def finish(request: Request):
     _same_origin(request)
-    token, _ = await current(request)
+    token, session = await current(request)
     payload = await _json_body(request)
     outcome = payload.get("outcome")
     if not isinstance(outcome, str):
       raise ProtocolError("invalid_outcome", "Outcome is required.", 400)
-    if not claim_finish():
-      raise ProtocolError(
-        "turn_active",
-        "Wait for the active recovery turn to finish before closing recovery.",
-        409,
-      )
-    try:
-      progress = await asyncio.to_thread(sessions.begin_finish, token, outcome)
-    finally:
-      release_finish()
+    requested_generation = payload.get("generation")
+    if (
+      isinstance(requested_generation, bool)
+      or not isinstance(requested_generation, int)
+      or requested_generation < 1
+    ):
+      raise ProtocolError("invalid_generation", "Generation is required.", 400)
+    stale_progress = None
+    # Pair the browser generation check with gate acquisition. A delayed g1
+    # request must not claim an idle gate after another request resumes g2,
+    # while a true concurrent g1 request may safely share its idempotent job.
+    with session._finish_lock:
+      if requested_generation < session.finish_generation:
+        stale_progress = {
+          "status": "resumed",
+          "outcome": outcome,
+          "generation": session.finish_generation,
+        }
+      elif requested_generation > session.finish_generation:
+        raise ProtocolError(
+          "invalid_generation", "Finish generation is not current.", 409
+        )
+      elif not finish_active() and not claim_finish():
+        raise ProtocolError(
+          "turn_active",
+          "Wait for the active recovery turn to finish before closing recovery.",
+          409,
+        )
+    if stale_progress is not None:
+      return _finish_http_response(stale_progress)
+    # Cancellation deliberately leaves the process-wide gate claimed. The
+    # executor may already be about to quiesce the session even if the browser
+    # task observes cancellation first, so reopening here would create a race.
+    # Only a successful resume or session revocation releases the gate.
+    progress = await asyncio.to_thread(
+      sessions.begin_finish, token, outcome, requested_generation
+    )
     return _finish_http_response(progress)
 
   @app.get("/api/finish/status")

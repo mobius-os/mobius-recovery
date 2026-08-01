@@ -9,6 +9,7 @@ import secrets
 import shutil
 import signal
 import socket
+import stat
 import subprocess
 import threading
 import time
@@ -25,8 +26,9 @@ from .config import STATE_DIR
 from .protocol import ProtocolError
 
 
-CLAUDE_DIR = STATE_DIR / "providers" / "claude"
-CODEX_DIR = STATE_DIR / "providers" / "codex"
+PROVIDERS_DIR = STATE_DIR / "providers"
+CLAUDE_DIR = PROVIDERS_DIR / "claude"
+CODEX_DIR = PROVIDERS_DIR / "codex"
 
 _CLAUDE_CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
 _AUTHORIZE_URL = "https://claude.com/cai/oauth/authorize"
@@ -426,5 +428,15 @@ class ProviderAuth:
       self._pkce = None
     with self._codex_lock:
       self._codex = {"proc": None, "result": None, "output": ""}
-    for path in (CLAUDE_DIR, CODEX_DIR):
-      shutil.rmtree(path, ignore_errors=True)
+    for root in {CLAUDE_DIR.parent, CODEX_DIR.parent}:
+      try:
+        info = root.lstat()
+      except FileNotFoundError:
+        continue
+      try:
+        if stat.S_ISDIR(info.st_mode) and not stat.S_ISLNK(info.st_mode):
+          shutil.rmtree(root)
+        else:
+          root.unlink()
+      except FileNotFoundError:
+        pass

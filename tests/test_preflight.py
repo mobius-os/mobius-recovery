@@ -1,14 +1,20 @@
 from __future__ import annotations
 
+import hashlib
+
 import httpx
 from fastapi.testclient import TestClient
+import pytest
 
 from recovery_worker.app import create_app
 from recovery_worker.config import Settings, baked_build_revision
+from recovery_worker.preflight import PreflightBindings, managed_target_url
+from recovery_worker.protocol import ProtocolError, TargetCapability
 
 
 BOOTSTRAP = "bootstrap-" + "b" * 32
 TARGET_TOKEN = "target-" + "t" * 40
+MANAGED_TARGET_URL = "http://mobius.railway.internal:18002"
 
 
 def settings() -> Settings:
@@ -28,7 +34,7 @@ def settings() -> Settings:
 
 def request(client: TestClient, **overrides):
   body = {
-    "target_url": "http://mobius.railway.internal:18002",
+    "target_url": MANAGED_TARGET_URL,
     "target_token": TARGET_TOKEN,
   }
   body.update(overrides)
@@ -86,7 +92,7 @@ def test_preflight_rejects_bad_bootstrap_and_public_ssrf_target(tmp_path) -> Non
       "/internal/target/verify",
       headers={"Authorization": "Bearer wrong"},
       json={
-        "target_url": "http://mobius.railway.internal:18002",
+        "target_url": MANAGED_TARGET_URL,
         "target_token": TARGET_TOKEN,
       },
     )
@@ -99,7 +105,7 @@ def test_preflight_rejects_bad_bootstrap_and_public_ssrf_target(tmp_path) -> Non
       "/internal/target/verify",
       headers=[(b"authorization", b"Bearer caf\xe9")],
       json={
-        "target_url": "http://mobius.railway.internal:18002",
+        "target_url": MANAGED_TARGET_URL,
         "target_token": TARGET_TOKEN,
       },
     )
@@ -131,3 +137,82 @@ def test_preflight_rejects_redirect_protocol_mismatch_and_wrong_mode(tmp_path) -
     wrong_mode = request(client)
     assert wrong_mode.status_code == 409
     assert wrong_mode.json()["error"]["code"] == "target_not_recovery"
+
+
+@pytest.mark.parametrize(
+  "candidate",
+  [
+    "http://other.service.railway.internal:18002",
+    "http://Mobius.railway.internal:18002",
+    "http://mobius.railway.internal:18002/",
+    "http://user@mobius.railway.internal:18002",
+    "http://mobius.railway.internal:18002?probe=1",
+    "http://mobius.railway.internal:18002#fragment",
+    "https://mobius.railway.internal:18002",
+    "http://mobius.railway.internal:18003",
+  ],
+)
+def test_managed_target_url_requires_canonical_private_endpoint(
+  candidate: str,
+) -> None:
+  assert managed_target_url(MANAGED_TARGET_URL) == MANAGED_TARGET_URL
+  assert managed_target_url("http://other.railway.internal:18002") == (
+    "http://other.railway.internal:18002"
+  )
+  with pytest.raises(ProtocolError) as rejected:
+    managed_target_url(candidate)
+  assert rejected.value.code == "invalid_target"
+
+
+def test_preflight_binding_requires_matching_token_hash_and_is_one_use() -> None:
+  bindings = PreflightBindings(clock=lambda: 100.0)
+  recorded = TargetCapability(MANAGED_TARGET_URL, TARGET_TOKEN)
+  bindings.record(recorded)
+  advertised_hash = hashlib.sha256(TARGET_TOKEN.encode("utf-8")).hexdigest()
+
+  accepted = TargetCapability(MANAGED_TARGET_URL, TARGET_TOKEN)
+  bindings.consume(accepted, advertised_hash)
+  assert accepted.token == TARGET_TOKEN
+
+  replay = TargetCapability(MANAGED_TARGET_URL, TARGET_TOKEN)
+  with pytest.raises(ProtocolError) as rejected:
+    bindings.consume(replay, advertised_hash)
+  assert rejected.value.code == "unverified_target"
+  assert replay.base_url == ""
+  assert replay.token == ""
+
+
+def test_preflight_binding_rejects_mismatched_advertised_token_hash() -> None:
+  bindings = PreflightBindings(clock=lambda: 100.0)
+  bindings.record(TargetCapability(MANAGED_TARGET_URL, TARGET_TOKEN))
+  capability = TargetCapability(MANAGED_TARGET_URL, TARGET_TOKEN)
+
+  with pytest.raises(ProtocolError) as rejected:
+    bindings.consume(capability, "0" * 64)
+  assert rejected.value.code == "invalid_exchange"
+  assert capability.base_url == ""
+  assert capability.token == ""
+
+
+def test_preflight_binding_rejects_wrong_capability_and_expiry() -> None:
+  now = [100.0]
+  bindings = PreflightBindings(clock=lambda: now[0])
+  bindings.record(TargetCapability(MANAGED_TARGET_URL, TARGET_TOKEN))
+  wrong_token = "wrong-" + "w" * 40
+  wrong = TargetCapability(MANAGED_TARGET_URL, wrong_token)
+  with pytest.raises(ProtocolError) as mismatched:
+    bindings.consume(
+      wrong, hashlib.sha256(wrong_token.encode("utf-8")).hexdigest()
+    )
+  assert mismatched.value.code == "unverified_target"
+  assert wrong.token == ""
+
+  bindings.record(TargetCapability(MANAGED_TARGET_URL, TARGET_TOKEN))
+  now[0] += 15 * 60
+  expired = TargetCapability(MANAGED_TARGET_URL, TARGET_TOKEN)
+  with pytest.raises(ProtocolError) as rejected:
+    bindings.consume(
+      expired, hashlib.sha256(TARGET_TOKEN.encode("utf-8")).hexdigest()
+    )
+  assert rejected.value.code == "unverified_target"
+  assert expired.token == ""

@@ -14,6 +14,7 @@ from recovery_worker.broker import BrokerClient, TargetBroker
 from recovery_worker.providers import ProviderAuth
 from recovery_worker.protocol import TargetCapability
 from recovery_worker.sessions import RecoverySession
+from recovery_worker.workspace import SessionWorkspaces
 
 
 TARGET_TOKEN = "target-secret-" + "x" * 40
@@ -32,7 +33,9 @@ def test_turn_cleanup_kills_escaped_helper_without_revoking_broker(
 ) -> None:
   helpers: list[tuple[subprocess.Popen, int]] = []
 
-  async def escaped_provider(_provider, _session, _provider_auth):
+  async def escaped_provider(
+    _provider, _session, _provider_auth, _workspaces
+  ):
     helper = subprocess.Popen(
       [
         sys.executable,
@@ -74,6 +77,8 @@ def test_turn_cleanup_kills_escaped_helper_without_revoking_broker(
     target=TargetCapability("http://target.internal", TARGET_TOKEN),
     expires_at=datetime.now(timezone.utc) + timedelta(minutes=10),
   )
+  workspaces = SessionWorkspaces(tmp_path / "workspaces")
+  session.workspace = workspaces.create()
   provider_auth = ProviderAuth()
   session.provider_generation = provider_auth.active_generation()
 
@@ -81,7 +86,7 @@ def test_turn_cleanup_kills_escaped_helper_without_revoking_broker(
     return [
       event
       async for event in chat.stream_turn(
-        "inspect target", "claude", session, provider_auth
+        "inspect target", "claude", session, provider_auth, workspaces
       )
     ]
 
