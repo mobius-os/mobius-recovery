@@ -30,7 +30,10 @@ versioned target protocol, never in the worker container.
 Managed sessions are opened from mobius.you and run in a sleeping Railway
 service inside the instance's project. Self-hosted sessions use the same image,
 a locally generated one-time token, and a private repair target. The owner may
-need to reconnect Claude or Codex during the incident.
+need to reconnect Claude or Codex during the incident. Every managed open
+force-deploys the approved immutable digest; every self-hosted open pulls
+`stable` and recreates the worker with a fresh `/state` tmpfs. An arbitrary
+process restart is session invalidation, not the freshness mechanism.
 
 ## Capabilities and Constraints
 
@@ -38,10 +41,16 @@ need to reconnect Claude or Codex during the incident.
 - Claude and Codex provider login and recovery chat.
 - Remote health, command, read, write, and list operations through
   `mobius-recovery-target/v1`.
-- A narrow finish callback that cannot select or mutate the recovery service.
+- No agent-facing target selector. An authenticated controller-only
+  `/internal/target/verify` route binds the exact managed target before launch,
+  and the narrow finish callback cannot select or mutate the recovery service.
 - No Railway token, Docker socket, sudo, setuid program, persistent code, or
   self-update mechanism in the worker.
-- Provider credentials and chat history are ephemeral.
+- Provider credentials and chat history are ephemeral. Same-uid
+  model-controlled tools can read their own provider CLI's OAuth credential, so
+  recovery should use a dedicated, short-lived, narrowly scoped, revocable
+  authorization and wipe/revoke it after the incident. Target, bootstrap,
+  Railway, and control-plane credentials remain outside that provider boundary.
 - A visible managed recovery page keeps its in-memory worker awake; hidden or
   closed pages permit sleep, and a restarted process requires a fresh launch.
 

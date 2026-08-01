@@ -12,15 +12,26 @@ target client. It deliberately contains none of the following:
 
 - `sudo`, setuid programs, a Docker socket, or a Railway credential;
 - a writable or persistent code mount;
-- a self-update, deployment, target-selection, or image-management endpoint;
+- an agent-facing self-update, deployment, target selector, or image-management
+  interface;
 - the target bearer in a provider subprocess environment.
+
+Managed mode does expose authenticated controller-only
+`POST /internal/target/verify`. It validates and binds the exact private target
+supplied by mobius.you; it is not an agent-facing selector and returns no target
+credential.
 
 The container runs as uid/gid `10001:10001`. `/app` and the target-client wrapper
 are root-owned and non-writable. Every activation gets an unpredictable
 mode-`0700` workspace which is also the provider subprocess `HOME`; replacement,
-expiry, finish, and restart destroy it together with both providers' state.
-Browser sessions and chat history remain process-local. Production mounts
-`/state` as an ephemeral volume/tmpfs and never as application data.
+expiry, and finish destroy it together with both providers' state. Browser
+sessions and chat history remain process-local. In managed deployments, `/state`
+is ephemeral container-local storage; the self-hosted launcher mounts `/state`
+as tmpfs. Neither is application data. A same-container process restart revokes
+the in-memory session, but is not the freshness or cleanup contract: mobius.you
+force-deploys the approved immutable digest before every managed open, while
+`mobiusctl` pulls `stable` and recreates the worker and its tmpfs before every
+self-hosted open or reopen.
 
 The Python worker must be container PID 1. Do not enable Docker/Compose `init`
 or place a same-uid process wrapper in front of it: such a wrapper would retain
@@ -42,6 +53,18 @@ writes are restricted to `/data` and `/tmp`. The target independently enforces
 the same roots with beneath/no-magic-link filesystem resolution. Root repair
 outside those convenience roots remains possible only through the explicit
 `exec` operation.
+
+The same-uid boundary does not protect a provider credential from that provider
+itself. After the owner authorizes Claude or Codex, its model-controlled Bash or
+other tool execution can read that CLI's own ephemeral OAuth credential beneath
+the session `HOME`. Treat that credential as inside the agent session's trust
+boundary. The remote target bearer, managed bootstrap and control capabilities
+remain in the non-dumpable PID 1 process and outside provider environments and
+files; Railway credentials never enter the worker. Use a dedicated,
+short-lived, narrowly scoped, and readily revocable provider authorization when
+the provider supports one. Finish the session to trigger the credential wipe
+and revoke the authorization after recovery when appropriate; wiping cannot
+invalidate a token that was copied before cleanup.
 
 ## Session flows
 
@@ -121,9 +144,11 @@ Run exactly one worker replica. Browser sessions, provider credentials, launch
 limits, and the broker are intentionally process-local; replicas cannot share
 them. A deploy, crash, Railway sleep, or host restart revokes the process's
 sessions and requires a fresh launch from mobius.you. This does not alter target
-data. Railway should run the service with serverless sleep enabled and use the
-external `/health` endpoint to wake it; every launch is gated on the currently
-approved immutable image digest, so sleeping does not pin an old recovery build.
+data. Revocation on process loss is distinct from artifact freshness: before
+each open, mobius.you force-deploys the currently approved immutable image
+digest and waits for that deployment to verify. Railway should run the service
+with serverless sleep enabled and use the external `/health` endpoint to wake
+it; sleeping therefore does not pin an old recovery build.
 
 Before mobius.you sends a launch form, it verifies the newly deployed worker
 against the intended private target:
@@ -143,7 +168,9 @@ target identity, and returns no target credential. A successful probe records a
 short-lived one-use keyed binding of that exact URL and bearer. Exchange and
 resume responses must advertise the bearer SHA-256 and consume the matching
 binding; an unprobed URL, wrong bearer/hash, replay, or expired binding is
-rejected before a broker can start.
+rejected before a broker can start. This authenticated controller route is the
+only managed target-binding surface; neither the browser nor the provider agent
+receives a selector or its bootstrap secret.
 
 ### Self-hosted
 
@@ -161,8 +188,10 @@ Bind the worker to loopback or an authenticated tunnel; do not put a
 local recovery port directly on the public Internet. The Mobius repository ships
 the `mobiusctl recovery` launcher and matching target daemon, so a reverse proxy
 or custom Caddy configuration is not required for the default loopback flow.
-Restarting either recovery process invalidates the launch; rerun the launcher to
-mint a fresh target bearer and owner code.
+Restarting either recovery process invalidates the launch. Use `mobiusctl`
+again: it pulls the current `stable` image, recreates the worker and `/state`
+tmpfs, and mints a fresh target bearer and owner code. Restart alone is not a
+substitute for that recreate path.
 
 The paired Mobius image and its recovery target are currently amd64-only. The
 worker Dockerfile fails fast for any other `TARGETARCH`; ARM support should be
