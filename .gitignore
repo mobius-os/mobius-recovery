@@ -2,3 +2,10 @@
 *.swp
 node_modules/
 _site/
+.pytest_cache/
+__pycache__/
+*.py[cod]
+.coverage
+htmlcov/
+.venv/
+.env

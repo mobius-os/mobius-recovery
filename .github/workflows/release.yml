@@ -1,0 +1,129 @@
+name: Test and publish recovery
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: recovery-release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+      - run: pip install --requirement requirements-dev.txt
+      - run: pytest
+
+  image:
+    needs: test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build the image that will be published
+        run: |
+          docker build \
+            --build-arg VCS_REF="$GITHUB_SHA" \
+            --build-arg VERSION="$(cat VERSION)" \
+            --tag mobius-recovery:verified .
+      - name: Verify immutable and non-root boundary
+        run: scripts/verify-image.sh mobius-recovery:verified "$GITHUB_SHA"
+      - name: Log in to GitHub Container Registry
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Publish immutable workflow-attempt image
+        id: publish
+        if: github.event_name != 'pull_request'
+        run: |
+          image="ghcr.io/mobius-os/mobius-recovery"
+          case "$GITHUB_RUN_ID" in (*[!0-9]*|'') exit 2;; esac
+          case "$GITHUB_RUN_ATTEMPT" in (*[!0-9]*|'') exit 2;; esac
+          test "$GITHUB_RUN_ATTEMPT" -lt 1000
+          attempt_tag="sha-${GITHUB_SHA}-run-${GITHUB_RUN_ID}-attempt-${GITHUB_RUN_ATTEMPT}"
+          docker tag mobius-recovery:verified "$image:$attempt_tag"
+          output=$(docker push "$image:$attempt_tag")
+          printf '%s\n' "$output"
+          digest=$(printf '%s\n' "$output" | sed -n \
+            's/^digest: \(sha256:[0-9a-f]\{64\}\).*/\1/p' | tail -n 1)
+          test -n "$digest"
+          sequence=$((GITHUB_RUN_ID * 1000 + GITHUB_RUN_ATTEMPT))
+          printf 'attempt_tag=%s\n' "$attempt_tag" >> "$GITHUB_OUTPUT"
+          printf 'image_digest=%s\n' "$digest" >> "$GITHUB_OUTPUT"
+          printf 'release_sequence=%s\n' "$sequence" >> "$GITHUB_OUTPUT"
+      - name: Confirm this is still the current main release
+        id: current
+        if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+        run: |
+          git fetch --no-tags origin main
+          if [ "$(git rev-parse origin/main)" != "$GITHUB_SHA" ]; then
+            echo "Main advanced; this older image will not be released"
+            echo "eligible=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "eligible=true" >> "$GITHUB_OUTPUT"
+      - name: Advance durable mobius.you recovery release
+        id: durable
+        if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main' && steps.current.outputs.eligible == 'true'
+        env:
+          MOBIUS_YOU_RELEASE_URL: ${{ secrets.MOBIUS_YOU_RELEASE_URL }}
+          MOBIUS_YOU_RELEASE_TOKEN: ${{ secrets.MOBIUS_YOU_RELEASE_TOKEN }}
+          IMAGE_DIGEST: ${{ steps.publish.outputs.image_digest }}
+          RELEASE_SEQUENCE: ${{ steps.publish.outputs.release_sequence }}
+        run: |
+          if [ -z "${MOBIUS_YOU_RELEASE_URL:-}" ] || \
+             [ -z "${MOBIUS_YOU_RELEASE_TOKEN:-}" ]; then
+            echo "mobius.you release webhook credentials are required for main releases" >&2
+            exit 1
+          fi
+          payload=$(printf \
+            '{"build_sha":"%s","image_digest":"%s","release_sequence":%s}' \
+            "$GITHUB_SHA" "$IMAGE_DIGEST" "$RELEASE_SEQUENCE")
+          status=$(curl --silent --show-error --retry 3 --retry-all-errors \
+            --connect-timeout 10 --max-time 45 \
+            --output /tmp/recovery-release-response.json \
+            --write-out '%{http_code}' \
+            --request POST \
+            --header "Authorization: Bearer $MOBIUS_YOU_RELEASE_TOKEN" \
+            --header 'Content-Type: application/json' \
+            --data "$payload" \
+            "${MOBIUS_YOU_RELEASE_URL%/}/internal/recovery/releases/publish")
+          case "$status" in
+            200|202) ;;
+            *)
+              echo "mobius.you release webhook returned HTTP $status" >&2
+              sed -n '1,20p' /tmp/recovery-release-response.json >&2
+              exit 1
+              ;;
+          esac
+          echo "approved=true" >> "$GITHUB_OUTPUT"
+      - name: Promote durably approved main image to stable
+        id: promote
+        if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main' && steps.durable.outputs.approved == 'true'
+        run: |
+          image="ghcr.io/mobius-os/mobius-recovery"
+          git fetch --no-tags origin main
+          if [ "$(git rev-parse origin/main)" != "$GITHUB_SHA" ]; then
+            echo "Main advanced during release approval; stable remains untouched"
+            echo "promoted=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          docker tag mobius-recovery:verified "$image:stable"
+          docker push "$image:stable"
+          echo "promoted=true" >> "$GITHUB_OUTPUT"
