@@ -60,15 +60,40 @@ jobs:
           test "$GITHUB_RUN_ATTEMPT" -lt 1000
           attempt_tag="sha-${GITHUB_SHA}-run-${GITHUB_RUN_ID}-attempt-${GITHUB_RUN_ATTEMPT}"
           docker tag mobius-recovery:verified "$image:$attempt_tag"
-          output=$(docker push "$image:$attempt_tag")
-          printf '%s\n' "$output"
-          digest=$(printf '%s\n' "$output" | sed -n \
-            's/^digest: \(sha256:[0-9a-f]\{64\}\).*/\1/p' | tail -n 1)
-          test -n "$digest"
+          docker push "$image:$attempt_tag"
+          digest=$(docker buildx imagetools inspect \
+            "$image:$attempt_tag" --format '{{.Manifest.Digest}}')
+          test "${#digest}" -eq 71
+          case "$digest" in
+            sha256:*) ;;
+            *) exit 2 ;;
+          esac
+          case "${digest#sha256:}" in
+            *[!0-9a-f]*|'') exit 2 ;;
+          esac
           sequence=$((GITHUB_RUN_ID * 1000 + GITHUB_RUN_ATTEMPT))
           printf 'attempt_tag=%s\n' "$attempt_tag" >> "$GITHUB_OUTPUT"
           printf 'image_digest=%s\n' "$digest" >> "$GITHUB_OUTPUT"
           printf 'release_sequence=%s\n' "$sequence" >> "$GITHUB_OUTPUT"
+      - name: Verify immutable digest is anonymously pullable
+        if: github.event_name != 'pull_request'
+        env:
+          IMAGE_DIGEST: ${{ steps.publish.outputs.image_digest }}
+        run: |
+          image="ghcr.io/mobius-os/mobius-recovery"
+          anonymous_config="$RUNNER_TEMP/anonymous-docker"
+          install -d -m 0700 "$anonymous_config"
+          observed=""
+          for attempt in 1 2 3 4 5 6 7 8; do
+            observed=$(DOCKER_CONFIG="$anonymous_config" \
+              docker buildx imagetools inspect "$image@$IMAGE_DIGEST" \
+              --format '{{.Manifest.Digest}}' 2>/dev/null) || true
+            if [ "$observed" = "$IMAGE_DIGEST" ]; then
+              break
+            fi
+            sleep "$attempt"
+          done
+          test "$observed" = "$IMAGE_DIGEST"
       - name: Confirm this is still the current main release
         id: current
         if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
@@ -128,4 +153,18 @@ jobs:
           fi
           docker tag mobius-recovery:verified "$image:stable"
           docker push "$image:stable"
+          anonymous_config="$RUNNER_TEMP/anonymous-docker-stable"
+          install -d -m 0700 "$anonymous_config"
+          expected="${{ steps.publish.outputs.image_digest }}"
+          observed=""
+          for attempt in 1 2 3 4 5 6 7 8; do
+            observed=$(DOCKER_CONFIG="$anonymous_config" \
+              docker buildx imagetools inspect "$image:stable" \
+              --format '{{.Manifest.Digest}}' 2>/dev/null) || true
+            if [ "$observed" = "$expected" ]; then
+              break
+            fi
+            sleep "$attempt"
+          done
+          test "$observed" = "$expected"
           echo "promoted=true" >> "$GITHUB_OUTPUT"

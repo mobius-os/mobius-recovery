@@ -2,6 +2,9 @@
 
 FROM node:24-trixie-slim AS provider-clis
 
+ARG TARGETARCH=amd64
+RUN test "$TARGETARCH" = "amd64"
+
 RUN npm install -g --omit=dev \
       @anthropic-ai/claude-code@2.1.218 \
       @openai/codex@0.145.0 \
@@ -13,6 +16,11 @@ FROM python:3.12-slim-trixie
 
 ARG VCS_REF=development
 ARG VERSION=1.0.0
+ARG TARGETARCH=amd64
+
+# The paired Mobius target image is currently amd64-only. Fail at build time
+# instead of publishing an ARM worker that cannot recover an ARM target.
+RUN test "$TARGETARCH" = "amd64"
 
 LABEL org.opencontainers.image.title="Mobius Recovery Worker" \
       org.opencontainers.image.source="https://github.com/mobius-os/mobius-recovery" \
