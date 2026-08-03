@@ -67,6 +67,7 @@ def test_preflight_validates_recovery_target_without_retaining_secret(tmp_path) 
       "target": "mobius",
       "build_sha": "a" * 40,
       "deployment_id": "deployment-123",
+      "boot_id": "b" * 32,
     })
 
   app = create_app(
@@ -84,6 +85,7 @@ def test_preflight_validates_recovery_target_without_retaining_secret(tmp_path) 
       "build_sha": "a" * 40,
       "mode": "normal",
       "deployment_id": "deployment-123",
+      "boot_id": "b" * 32,
     }
   assert not hasattr(app.state, "target_token")
   assert TARGET_TOKEN not in repr(app.state.__dict__)
@@ -187,6 +189,8 @@ def test_preflight_rejects_redirect_protocol_mismatch_and_wrong_mode(tmp_path) -
     ("build_sha", "x" * 129),
     ("deployment_id", None),
     ("deployment_id", "x" * 129),
+    ("boot_id", None),
+    ("boot_id", "x" * 129),
   ],
 )
 def test_preflight_rejects_unbounded_target_identity(
@@ -198,6 +202,7 @@ def test_preflight_rejects_unbounded_target_identity(
     "target": "mobius",
     "build_sha": "a" * 40,
     "deployment_id": "deployment-123",
+    "boot_id": "b" * 32,
   }
   health[field] = value
   app = create_app(

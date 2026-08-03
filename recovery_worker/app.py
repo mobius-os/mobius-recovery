@@ -550,6 +550,13 @@ def create_app(
       response["deployment_id"] = _target_identity(result, "deployment_id")
     elif result["mode"] == "normal":
       _target_identity(result, "deployment_id")
+    # A normal live target is a process-local authority.  Forward its exact
+    # per-boot identity so the controller can bind the eventual session token
+    # to this container incarnation; a restart then invalidates the old token
+    # even when Railway keeps the deployment id unchanged.  Legacy stopped-app
+    # targets intentionally have no boot identity.
+    if result["mode"] == "normal":
+      response["boot_id"] = _target_identity(result, "boot_id")
     preflight.record(capability)
     return _security_headers(JSONResponse(response))
 
