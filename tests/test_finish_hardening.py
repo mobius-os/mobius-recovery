@@ -342,6 +342,154 @@ def test_stale_browser_generation_cannot_claim_or_quiesce_resumed_target(
   assert not finish_active()
 
 
+def test_managed_finish_self_revokes_before_controller_commit(tmp_path) -> None:
+  events: list[str] = []
+  expiry = _expiry().isoformat()
+
+  def control(request: httpx.Request) -> httpx.Response:
+    if request.url.path == "/recovery/exchange":
+      return httpx.Response(200, json={
+        "session_id": "ordered-finish-session",
+        "target_url": MANAGED_URL,
+        "target_token": OLD_TOKEN,
+        "target_token_sha256": hashlib.sha256(OLD_TOKEN.encode()).hexdigest(),
+        "session_capability": "finish-" + "f" * 40,
+        "expires_at": expiry,
+      })
+    if request.url.path == "/recovery/exchange/ack":
+      return httpx.Response(200, json={
+        "status": "acknowledged", "session_id": "ordered-finish-session"
+      })
+    assert request.url.path == "/recovery/finish"
+    events.append("controller_finish")
+    return httpx.Response(200, json={
+      "finish_id": "finish_ordered_1",
+      "session_id": "ordered-finish-session",
+      "status": "finished",
+      "outcome": "recovered",
+      "generation": 1,
+      "status_url": "/recovery/finish/finish_ordered_1",
+    })
+
+  def target(request: httpx.Request) -> httpx.Response:
+    if request.url.path == "/v1/health":
+      events.append("target_health")
+      return httpx.Response(200, json={
+        "protocol": "mobius-recovery-target/v1",
+        "target": "mobius",
+        "mode": "normal",
+      })
+    assert request.url.path == "/v1/revoke"
+    assert json.loads(request.content) == {}
+    events.append("target_revoke")
+    return httpx.Response(200, json={
+      "status": "revoked",
+      "deployment_id": "deployment-ordered",
+      "session_id": "ordered-finish-session",
+    })
+
+  app = create_app(
+    _managed_settings(),
+    control_transport=httpx.MockTransport(control),
+    target_transport=httpx.MockTransport(target),
+    broker_path=tmp_path / "broker" / "target.sock",
+    workspace_root=tmp_path / "workspaces",
+  )
+  release_finish()
+  try:
+    app.state.preflight_bindings.record(TargetCapability(MANAGED_URL, OLD_TOKEN))
+    browser, session = app.state.sessions.start("finish-code", "mob_instance-1")
+    app.state.runtime.activate(session)
+    events.clear()
+
+    result = app.state.sessions.begin_finish(browser, "recovered")
+    assert result == {
+      "status": "finished",
+      "outcome": "recovered",
+      "generation": 1,
+      "finish_id": "finish_ordered_1",
+    }
+    assert events == ["target_health", "target_revoke", "controller_finish"]
+    assert app.state.sessions.get(browser) is None
+    assert app.state.runtime._active is None
+    assert not (tmp_path / "broker" / "target.sock").exists()
+  finally:
+    app.state.sessions.close()
+    app.state.runtime.close()
+    release_finish()
+
+
+def test_revoke_failure_prevents_controller_finish_and_clears_local_access(
+  tmp_path,
+) -> None:
+  controller_finish_calls = 0
+  target_calls: list[tuple[str, str]] = []
+  expiry = _expiry().isoformat()
+
+  def control(request: httpx.Request) -> httpx.Response:
+    nonlocal controller_finish_calls
+    if request.url.path == "/recovery/exchange":
+      return httpx.Response(200, json={
+        "session_id": "failed-revoke-session",
+        "target_url": MANAGED_URL,
+        "target_token": OLD_TOKEN,
+        "target_token_sha256": hashlib.sha256(OLD_TOKEN.encode()).hexdigest(),
+        "session_capability": "finish-" + "f" * 40,
+        "expires_at": expiry,
+      })
+    if request.url.path == "/recovery/exchange/ack":
+      return httpx.Response(200, json={
+        "status": "acknowledged", "session_id": "failed-revoke-session"
+      })
+    controller_finish_calls += 1
+    return httpx.Response(500)
+
+  def target(request: httpx.Request) -> httpx.Response:
+    target_calls.append((request.method, request.url.path))
+    if request.url.path == "/v1/health":
+      return httpx.Response(200, json={
+        "protocol": "mobius-recovery-target/v1",
+        "target": "mobius",
+        "mode": "normal",
+      })
+    raise httpx.ReadTimeout("revoke confirmation lost", request=request)
+
+  broker_path = tmp_path / "broker" / "target.sock"
+  app = create_app(
+    _managed_settings(),
+    control_transport=httpx.MockTransport(control),
+    target_transport=httpx.MockTransport(target),
+    broker_path=broker_path,
+    workspace_root=tmp_path / "workspaces",
+  )
+  release_finish()
+  try:
+    app.state.preflight_bindings.record(TargetCapability(MANAGED_URL, OLD_TOKEN))
+    browser, session = app.state.sessions.start("finish-code", "mob_instance-1")
+    app.state.runtime.activate(session)
+    workspace = session.workspace
+    assert workspace is not None and workspace.exists()
+
+    result = app.state.sessions.begin_finish(browser, "recovered")
+    assert result["status"] == "failed"
+    assert result["error"]["code"] == "target_timeout"
+    assert controller_finish_calls == 0
+    assert target_calls == [
+      ("GET", "/v1/health"),
+      ("POST", "/v1/revoke"),
+      ("POST", "/v1/revoke"),
+    ]
+    assert app.state.runtime._active is None
+    assert not broker_path.exists()
+    assert not workspace.exists()
+    assert session.target.base_url == ""
+    assert session.target.token == ""
+  finally:
+    app.state.sessions.close()
+    app.state.runtime.close()
+    release_finish()
+
+
 def test_cancelled_http_finish_during_blocked_control_post_stays_closed(
   tmp_path,
 ) -> None:
@@ -377,10 +525,23 @@ def test_cancelled_http_finish_during_blocked_control_post_stays_closed(
       "status_url": "/recovery/finish/finish_cancelled_http",
     })
 
+  def target(request: httpx.Request) -> httpx.Response:
+    if request.url.path == "/v1/health":
+      return httpx.Response(200, json={
+        "protocol": "mobius-recovery-target/v1",
+        "target": "mobius",
+        "mode": "normal",
+      })
+    return httpx.Response(200, json={
+      "status": "revoked",
+      "deployment_id": "deployment-cancelled",
+      "session_id": "cancelled-http-session",
+    })
+
   app = create_app(
     _managed_settings(),
     control_transport=httpx.MockTransport(control),
-    target_transport=httpx.MockTransport(lambda _request: httpx.Response(200)),
+    target_transport=httpx.MockTransport(target),
     broker_path=tmp_path / "broker" / "target.sock",
     workspace_root=tmp_path / "workspaces",
   )

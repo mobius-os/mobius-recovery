@@ -103,6 +103,75 @@ def test_mobius_target_operations_work_through_fixed_broker(
     broker.stop()
 
 
+def test_live_self_revoke_is_private_to_broker_owner(tmp_path) -> None:
+  socket_path = tmp_path / "private" / "target.sock"
+  calls: list[tuple[str, str]] = []
+
+  def target(request: httpx.Request) -> httpx.Response:
+    calls.append((request.method, request.url.path))
+    if request.url.path == "/v1/health":
+      return httpx.Response(200, json={
+        "protocol": "mobius-recovery-target/v1",
+        "target": "mobius",
+        "mode": "normal",
+      })
+    assert json.loads(request.content) == {}
+    return httpx.Response(200, json={
+      "status": "revoked",
+      "deployment_id": "deployment-123",
+      "session_id": "session-456",
+    })
+
+  broker = TargetBroker(
+    TargetCapability("http://target.internal", TARGET_TOKEN),
+    allowed_modes=frozenset({"normal", "recovery"}),
+    transport=httpx.MockTransport(target),
+    path=socket_path,
+  )
+  broker.start()
+  try:
+    client = BrokerClient(socket_path)
+    assert not hasattr(client, "self_revoke")
+    with pytest.raises(ProtocolError) as hidden:
+      client._request("revoke")
+    assert hidden.value.code == "unknown_operation"
+    assert calls == []
+
+    assert broker.self_revoke() == {
+      "status": "revoked",
+      "deployment_id": "deployment-123",
+      "session_id": "session-456",
+    }
+    assert calls == [("GET", "/v1/health"), ("POST", "/v1/revoke")]
+  finally:
+    broker.stop()
+
+
+def test_legacy_recovery_finish_skips_live_session_revoke(tmp_path) -> None:
+  calls: list[tuple[str, str]] = []
+
+  def target(request: httpx.Request) -> httpx.Response:
+    calls.append((request.method, request.url.path))
+    return httpx.Response(200, json={
+      "protocol": "mobius-recovery-target/v1",
+      "target": "mobius",
+      "mode": "recovery",
+    })
+
+  broker = TargetBroker(
+    TargetCapability("http://target.internal", TARGET_TOKEN),
+    allowed_modes=frozenset({"normal", "recovery"}),
+    transport=httpx.MockTransport(target),
+    path=tmp_path / "private" / "target.sock",
+  )
+  broker.start()
+  try:
+    assert broker.self_revoke() is None
+    assert calls == [("GET", "/v1/health")]
+  finally:
+    broker.stop()
+
+
 def test_exact_eight_mib_write_crosses_broker_and_target_client(tmp_path) -> None:
   socket_path = tmp_path / "private" / "target.sock"
   payload = b"x" * MAX_FILE_BYTES

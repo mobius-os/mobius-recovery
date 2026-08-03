@@ -173,6 +173,7 @@ class TargetBroker:
     self,
     capability: TargetCapability,
     *,
+    allowed_modes: frozenset[str] = frozenset({"recovery"}),
     transport=None,
     path: Path = BROKER_SOCKET,
     expires_at: datetime | None = None,
@@ -191,7 +192,11 @@ class TargetBroker:
     if self._expires_at.tzinfo is None:
       raise ValueError("broker expiry must be timezone-aware")
     self._on_expire = on_expire
-    self._target = TargetClient(capability, transport=transport)
+    self._target = TargetClient(
+      capability,
+      allowed_modes=allowed_modes,
+      transport=transport,
+    )
     self._server = _UnixServer(str(self._path), self._target, self._expires_at)
     self._path.chmod(0o600)
     self._thread = threading.Thread(
@@ -229,6 +234,20 @@ class TargetBroker:
     self.stop()
     if self._on_expire:
       self._on_expire()
+
+  def self_revoke(self) -> dict[str, str] | None:
+    """Revoke a live target without exposing the operation to broker clients."""
+    with self._lifecycle_lock:
+      if self._stopped:
+        raise ProtocolError(
+          "broker_unavailable", "target broker is unavailable", 502
+        )
+    # Legacy recovery has a container-wide opaque bearer and is closed by the
+    # controller's normal-mode transition. Only signed live sessions implement
+    # per-session self-revocation.
+    if self._target.health().get("mode") != "normal":
+      return None
+    return self._target.self_revoke()
 
   def stop(self) -> None:
     with self._lifecycle_lock:

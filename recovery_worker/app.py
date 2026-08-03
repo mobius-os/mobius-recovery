@@ -47,12 +47,45 @@ MAX_BROWSER_SESSION_SECONDS = 60 * 60
 def _target_health(
   capability: TargetCapability,
   transport: httpx.BaseTransport | None,
+  allowed_modes: frozenset[str],
 ) -> dict:
-  target = TargetClient(capability, transport=transport)
+  target = TargetClient(
+    capability,
+    allowed_modes=allowed_modes,
+    transport=transport,
+  )
   try:
     return target.health()
   finally:
     target.close()
+
+
+def _target_self_revoke(
+  capability: TargetCapability,
+  transport: httpx.BaseTransport | None,
+  allowed_modes: frozenset[str],
+) -> dict[str, str]:
+  """Use one fixed controller-supplied capability to revoke its own target sid."""
+  target = TargetClient(
+    capability,
+    allowed_modes=allowed_modes,
+    transport=transport,
+  )
+  try:
+    return target.self_revoke()
+  finally:
+    target.close()
+
+
+def _target_identity(result: dict, field: str) -> str:
+  value = result.get(field)
+  if not isinstance(value, str) or not 1 <= len(value) <= 128:
+    raise ProtocolError(
+      "invalid_response",
+      f"Mobius target {field} is invalid.",
+      502,
+    )
+  return value
 
 
 class RecoveryRuntime:
@@ -66,12 +99,14 @@ class RecoveryRuntime:
     *,
     target_transport,
     broker_path,
+    target_modes: frozenset[str],
   ) -> None:
     self._providers = providers
     self._workspaces = workspaces
     self._preflight = preflight
     self._target_transport = target_transport
     self._broker_path = broker_path or BROKER_SOCKET
+    self._target_modes = target_modes
     self._active: tuple[str, TargetBroker] | None = None
     self._sessions: SessionStore | None = None
     self._lock = threading.RLock()
@@ -107,6 +142,7 @@ class RecoveryRuntime:
         session.provider_generation = self._providers.enable()
         broker = TargetBroker(
           session.target,
+          allowed_modes=self._target_modes,
           transport=self._target_transport,
           path=self._broker_path,
           expires_at=session.expires_at,
@@ -159,8 +195,19 @@ class RecoveryRuntime:
     self.activate(session, clear_providers=False, release_gate=False)
 
   def quiesce(self, session: RecoverySession) -> None:
-    """Stops every target-capable process while retaining poll capability."""
-    self.revoke(session, "finishing")
+    """Revoke live target authority, then close every local target process."""
+    try:
+      with self._lock:
+        if not self._active or self._active[0] != session.session_id:
+          raise ProtocolError(
+            "broker_unavailable", "target broker is unavailable", 502
+          )
+        self._active[1].self_revoke()
+    finally:
+      # Even an ambiguous remote failure must leave no local agent, socket, or
+      # bearer able to continue. The exception propagates so controller finish
+      # cannot be committed without a confirmed live-target revocation.
+      self.revoke(session, "finishing")
 
   def close(self) -> None:
     with self._lock:
@@ -297,6 +344,18 @@ def _same_origin(request: Request) -> None:
     raise ProtocolError("cross_site", "Cross-site request rejected.", 403)
 
 
+def _require_controller_auth(request: Request, settings: Settings) -> None:
+  if not settings.managed or not settings.bootstrap_secret:
+    raise ProtocolError("not_found", "Endpoint not found.", 404)
+  supplied = request.headers.get("authorization", "")
+  expected = f"Bearer {settings.bootstrap_secret}"
+  if len(supplied) > 1024 or not hmac.compare_digest(
+    supplied.encode("utf-8", "surrogatepass"),
+    expected.encode("utf-8"),
+  ):
+    raise ProtocolError("unauthorized", "Invalid controller credential.", 401)
+
+
 async def _sse_events(iterator, keepalive: float = SSE_KEEPALIVE_SECONDS):
   """Frames an event iterator and keeps silent remote tools through proxies."""
   pending = None
@@ -331,6 +390,10 @@ def create_app(
   """Creates one worker app; injection points are test-only transports."""
   settings = settings or Settings.from_env()
   settings.validate()
+  target_modes = (
+    frozenset({"normal", "recovery"})
+    if settings.managed else frozenset({"recovery"})
+  )
   preflight = PreflightBindings()
   control = (
     ControlClient(
@@ -361,6 +424,7 @@ def create_app(
     preflight,
     target_transport=target_transport,
     broker_path=broker_path,
+    target_modes=target_modes,
   )
   sessions = SessionStore(
     local_token=settings.local_token,
@@ -462,15 +526,7 @@ def create_app(
 
   @app.post("/internal/target/verify")
   async def verify_target(request: Request):
-    if not settings.managed or not settings.bootstrap_secret:
-      raise ProtocolError("not_found", "Endpoint not found.", 404)
-    supplied = request.headers.get("authorization", "")
-    expected = f"Bearer {settings.bootstrap_secret}"
-    if len(supplied) > 1024 or not hmac.compare_digest(
-      supplied.encode("utf-8", "surrogatepass"),
-      expected.encode("utf-8"),
-    ):
-      raise ProtocolError("unauthorized", "Invalid controller credential.", 401)
+    _require_controller_auth(request, settings)
     payload = await _json_body(request, 16 * 1024)
     if set(payload) != {"target_url", "target_token"}:
       raise ProtocolError(
@@ -481,23 +537,47 @@ def create_app(
     target_url = managed_target_url(payload.get("target_url"))
     capability = TargetCapability.parse(target_url, payload.get("target_token"))
     result = await asyncio.to_thread(
-      _target_health, capability, target_transport
+      _target_health, capability, target_transport, target_modes
     )
-    if result.get("mode") != "recovery" or result.get("target") != "mobius":
-      raise ProtocolError(
-        "target_not_recovery",
-        "Mobius target is not in recovery mode.",
-        409,
-      )
-    preflight.record(capability)
     response = {
       "status": "ok",
       "protocol": result["protocol"],
+      "build_sha": _target_identity(result, "build_sha"),
+      "mode": result["mode"],
     }
-    build_sha = result.get("build_sha")
-    if isinstance(build_sha, str) and 0 < len(build_sha) <= 128:
-      response["build_sha"] = build_sha
+    deployment_id = result.get("deployment_id")
+    if deployment_id is not None:
+      response["deployment_id"] = _target_identity(result, "deployment_id")
+    elif result["mode"] == "normal":
+      _target_identity(result, "deployment_id")
+    preflight.record(capability)
     return _security_headers(JSONResponse(response))
+
+  @app.post("/internal/target/revoke")
+  async def revoke_target(request: Request):
+    """Controller-only close path for the exact supplied target capability."""
+    _require_controller_auth(request, settings)
+    payload = await _json_body(request, 16 * 1024)
+    if set(payload) != {"target_url", "target_token"}:
+      raise ProtocolError(
+        "invalid_request",
+        "target_url and target_token are required.",
+        400,
+      )
+    target_url = managed_target_url(payload.get("target_url"))
+    capability = TargetCapability.parse(target_url, payload.get("target_token"))
+    try:
+      result = await asyncio.to_thread(
+        _target_self_revoke,
+        capability,
+        target_transport,
+        target_modes,
+      )
+    finally:
+      capability.clear()
+    # Identity comes only from the authenticated target response. The caller
+    # cannot submit deployment/session fields for the worker to reflect.
+    return _security_headers(JSONResponse(result))
 
   @app.get("/", response_class=HTMLResponse)
   async def index(request: Request):
@@ -552,7 +632,9 @@ def create_app(
       )
       return _security_headers(HTMLResponse(body, status_code=exc.status), nonce)
     try:
-      await asyncio.to_thread(_target_health, session.target, target_transport)
+      await asyncio.to_thread(
+        _target_health, session.target, target_transport, target_modes
+      )
       session.readiness_error = None
     except ProtocolError as exc:
       session.readiness_error = exc.message
@@ -598,7 +680,7 @@ def create_app(
     _, session = await interactive(request)
     try:
       result = await asyncio.to_thread(
-        _target_health, session.target, target_transport
+        _target_health, session.target, target_transport, target_modes
       )
       session.readiness_error = None
       return _security_headers(JSONResponse({"status": "ready", "target": result}))

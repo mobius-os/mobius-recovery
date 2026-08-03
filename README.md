@@ -16,10 +16,11 @@ target client. It deliberately contains none of the following:
   interface;
 - the target bearer in a provider subprocess environment.
 
-Managed mode does expose authenticated controller-only
-`POST /internal/target/verify`. It validates and binds the exact private target
-supplied by mobius.you; it is not an agent-facing selector and returns no target
-credential.
+Managed mode exposes authenticated controller-only
+`POST /internal/target/verify` and `POST /internal/target/revoke`. Verify binds
+the exact private target supplied by mobius.you. Revoke can close only the
+supplied signed target capability and returns target-authenticated identity;
+neither route is agent-facing or returns a target credential.
 
 The container runs as uid/gid `10001:10001`. `/app` and the target-client wrapper
 are root-owned and non-writable. Every activation gets an unpredictable
@@ -103,12 +104,17 @@ The response supplies `session_id`, `target_url`, `target_token`,
 ephemeral. Finishing starts generation `1` and posts the session capability with
 `{"session_id":"...","outcome":"recovered|cancelled","generation":1}`.
 Before that first blocking request, the worker claims a process-wide finish
-gate, stops the broker and provider processes, deletes their workspace/state,
-and clears its target bearer. Browser cancellation or a lost response cannot
-reopen that boundary. The worker retains only the finish capability and polls
-the authenticated `status_url`; reloading the page continues that poll without
-restoring target access. Every queued, running, failed, resumed, or finished
-result carries its exact generation.
+gate. For a live normal-mode target it first asks the active broker to revoke
+the signed target session and requires the target's exact confirmation. It then
+stops the broker and provider processes, deletes their workspace/state, and
+clears its target bearer. A revoke failure keeps local access closed and
+prevents the controller finish from being committed. Legacy recovery-mode
+targets have no per-session revoke and retain their existing container-close
+flow. Browser cancellation or a lost response cannot reopen the local boundary.
+The worker retains only the finish capability and polls the authenticated
+`status_url`; reloading the page continues that poll without restoring target
+access. Every queued, running, failed, resumed, or finished result carries its
+exact generation.
 The browser also echoes the generation rendered into its page, so a delayed
 request from a pre-resume page can observe generation `2` but cannot start it.
 
@@ -163,14 +169,23 @@ Content-Type: application/json
 
 The worker accepts only the canonical single-service form
 `http://*.railway.internal:18002` (no trailing path, credentials, query, or
-fragment), disables redirects and process proxy variables, requires the v1
-target identity, and returns no target credential. A successful probe records a
-short-lived one-use keyed binding of that exact URL and bearer. Exchange and
-resume responses must advertise the bearer SHA-256 and consume the matching
-binding; an unprobed URL, wrong bearer/hash, replay, or expired binding is
-rejected before a broker can start. This authenticated controller route is the
-only managed target-binding surface; neither the browser nor the provider agent
-receives a selector or its bootstrap secret.
+fragment), disables redirects and process proxy variables, and requires the v1
+target identity. A managed target may be a live normal-mode attachment or a
+legacy recovery-mode target. A successful probe records a short-lived one-use
+keyed binding of that exact URL and bearer. Exchange and resume responses must
+advertise the bearer SHA-256 and consume the matching binding; an unprobed URL,
+wrong bearer/hash, replay, or expired binding is rejected before a broker can
+start. This authenticated controller route is the only managed target-binding
+surface; neither the browser nor the provider agent receives a selector or its
+bootstrap secret.
+
+The launcher dashboard can close a live target without an active browser by
+posting the same exact URL and signed bearer to bootstrap-authenticated
+`POST /internal/target/revoke`. The worker calls target `POST /v1/revoke`
+directly and returns only the target-authenticated
+`status`, `deployment_id`, and `session_id`, which the launcher can use for a
+stale-state compare-and-set. It does not create or replace an exchange preflight
+binding, and the revoke operation is absent from the broker and agent schemas.
 
 ### Self-hosted
 
@@ -191,7 +206,8 @@ or custom Caddy configuration is not required for the default loopback flow.
 Restarting either recovery process invalidates the launch. Use `mobiusctl`
 again: it pulls the current `stable` image, recreates the worker and `/state`
 tmpfs, and mints a fresh target bearer and owner code. Restart alone is not a
-substitute for that recreate path.
+substitute for that recreate path. Unlike managed mode, the local worker accepts
+only a target in strict recovery mode.
 
 The paired Mobius image and its recovery target are currently amd64-only. The
 worker Dockerfile fails fast for any other `TARGETARCH`; ARM support should be
@@ -211,13 +227,15 @@ file/stdin data is capped at 8 MiB; the base64 JSON wire envelope is capped at
 | Endpoint | Body/result |
 | --- | --- |
 | `GET /v1/health` | `protocol: mobius-recovery-target/v1`, target identity and mode |
+| `POST /v1/revoke` | empty object; live signed session returns `status`, `deployment_id`, `session_id` |
 | `POST /v1/exec` | `argv`, optional `cwd`, `env`, `stdin`/`stdin_base64`, timeout 1–900s |
 | `POST /v1/fs/read` | absolute `path`, `offset`, `limit` (maximum 8 MiB) |
 | `POST /v1/fs/write` | absolute `path`, base64 data, optional mode, atomic flag |
 | `POST /v1/fs/list` | absolute `path`, at most 10,000 entries |
 
-The client bounds remote JSON at 16 MiB and stdout/stderr at 4 MiB each. Remote
-output is treated as hostile data in the recovery agent prompt.
+The client bounds remote JSON at 16 MiB, revoke confirmation at 16 KiB, and
+stdout/stderr at 4 MiB each. Remote output is treated as hostile data in the
+recovery agent prompt.
 
 ## Health and releases
 

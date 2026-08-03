@@ -61,12 +61,19 @@ def local_settings() -> Settings:
 
 def target(request: httpx.Request) -> httpx.Response:
   assert request.headers["authorization"] == f"Bearer {TARGET_TOKEN}"
+  if request.url.path == "/v1/revoke":
+    return httpx.Response(200, json={
+      "status": "revoked",
+      "deployment_id": "deployment-test",
+      "session_id": "session-test",
+    })
+  mode = "normal" if request.url.host.endswith(".railway.internal") else "recovery"
   return httpx.Response(200, json={
     "status": "ready",
     "protocol": TARGET_PROTOCOL_VERSION,
     "target": "mobius",
     "target_id": "local",
-    "mode": "recovery",
+    "mode": mode,
   })
 
 
@@ -543,8 +550,6 @@ def test_managed_finish_freezes_target_and_survives_reload_and_poll_loss(
       headers=MANAGED_HANDOFF,
     )
     assert started.status_code == 200
-    target_calls_at_accept = target_calls
-
     accepted = client.post(
       "/api/finish",
       headers={
@@ -559,6 +564,7 @@ def test_managed_finish_freezes_target_and_survives_reload_and_poll_loss(
     session = next(iter(app.state.sessions._sessions.values()))
     assert session.finishing
     assert session.target.token == ""
+    target_calls_at_quiesce = target_calls
 
     frozen_target = client.get("/api/target/health")
     assert frozen_target.status_code == 409
@@ -572,7 +578,7 @@ def test_managed_finish_freezes_target_and_survives_reload_and_poll_loss(
       json={"message": "mutate after finish", "provider": "claude"},
     )
     assert frozen_chat.status_code == 409
-    assert target_calls == target_calls_at_accept
+    assert target_calls == target_calls_at_quiesce
 
     reloaded = client.get("/")
     assert "const initialFinishing=true;" in reloaded.text
@@ -586,7 +592,7 @@ def test_managed_finish_freezes_target_and_survives_reload_and_poll_loss(
     assert finished.json()["status"] == "finished"
     closed = client.get("/")
     assert "Recovery finished." in closed.text
-    assert target_calls == target_calls_at_accept
+    assert target_calls == target_calls_at_quiesce
 
 
 def test_local_finish_lands_on_closed_state_with_launcher_instruction(tmp_path) -> None:

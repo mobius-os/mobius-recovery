@@ -29,6 +29,7 @@ from .protocol import (
 # local broker cap the wire envelope at 12 MiB while independently enforcing
 # the 8 MiB decoded-data limit.
 MAX_REQUEST_BYTES = 12 * 1024 * 1024
+MAX_REVOKE_RESPONSE_BYTES = 16 * 1024
 READ_ROOTS = frozenset({"/data", "/app", "/tmp"})
 WRITE_ROOTS = frozenset({"/data", "/tmp"})
 
@@ -61,11 +62,15 @@ class TargetClient:
     self,
     capability: TargetCapability,
     *,
+    allowed_modes: frozenset[str] = frozenset({"recovery"}),
     transport: httpx.BaseTransport | None = None,
   ) -> None:
+    if not allowed_modes or not allowed_modes <= {"normal", "recovery"}:
+      raise ValueError("target modes must contain only normal or recovery")
     # The client owns a private copy. Revoking a broker must not mutate the
     # SessionStore's capability and make an intentional broker restart inert.
     self._capability = TargetCapability(capability.base_url, capability.token)
+    self._allowed_modes = allowed_modes
     self._revoked = threading.Event()
     self._client = httpx.Client(
       base_url=self._capability.base_url,
@@ -107,6 +112,7 @@ class TargetClient:
     payload: dict | None = None,
     *,
     timeout: httpx.Timeout | None = None,
+    max_response_bytes: int = MAX_HTTP_RESPONSE_BYTES,
   ) -> dict:
     if self._revoked.is_set():
       raise ProtocolError("auth_expired", "recovery session expired", 401)
@@ -126,9 +132,9 @@ class TargetClient:
         content_length = response.headers.get("content-length")
         if content_length:
           try:
-            if int(content_length) > MAX_HTTP_RESPONSE_BYTES:
+            if int(content_length) > max_response_bytes:
               raise ProtocolError(
-                "response_too_large", "target response exceeds 16 MiB"
+                "response_too_large", "target response exceeds its size limit"
               )
           except ValueError:
             pass
@@ -136,9 +142,9 @@ class TargetClient:
         total = 0
         for chunk in response.iter_bytes():
           total += len(chunk)
-          if total > MAX_HTTP_RESPONSE_BYTES:
+          if total > max_response_bytes:
             raise ProtocolError(
-              "response_too_large", "target response exceeds 16 MiB"
+              "response_too_large", "target response exceeds its size limit"
             )
           chunks.append(chunk)
         raw = b"".join(chunks)
@@ -180,13 +186,63 @@ class TargetClient:
       timeout=httpx.Timeout(10.0, connect=5.0),
     )
     require_protocol(payload)
-    if payload.get("target") != "mobius" or payload.get("mode") != "recovery":
+    if (
+      payload.get("target") != "mobius"
+      or payload.get("mode") not in self._allowed_modes
+    ):
+      if len(self._allowed_modes) == 1:
+        expected = next(iter(self._allowed_modes))
+        code = f"target_not_{expected}"
+        message = f"Mobius target is not in {expected} mode."
+      else:
+        code = "target_mode_invalid"
+        message = "Mobius target mode is not supported."
       raise ProtocolError(
-        "target_not_recovery",
-        "Mobius target is not in recovery mode.",
+        code,
+        message,
         409,
       )
     return payload
+
+  def self_revoke(self) -> dict[str, str]:
+    """Revoke this signed target session before discarding the local bearer.
+
+    The target operation is idempotent. Retry one ambiguous transport failure
+    so a committed revoke whose response was lost can still be confirmed. This
+    method is intentionally absent from the Unix broker and agent CLI schemas.
+    """
+    result: dict | None = None
+    for attempt in range(2):
+      try:
+        result = self._request(
+          "POST",
+          "/v1/revoke",
+          {},
+          timeout=httpx.Timeout(10.0, connect=5.0),
+          max_response_bytes=MAX_REVOKE_RESPONSE_BYTES,
+        )
+        break
+      except ProtocolError as exc:
+        if (
+          attempt == 0
+          and exc.code in {"target_timeout", "target_unreachable"}
+          and isinstance(exc.__cause__, httpx.HTTPError)
+        ):
+          continue
+        raise
+    if (
+      result is None
+      or set(result) != {"status", "deployment_id", "session_id"}
+      or result["status"] != "revoked"
+      or not isinstance(result["deployment_id"], str)
+      or not 1 <= len(result["deployment_id"]) <= 128
+      or not isinstance(result["session_id"], str)
+      or not 1 <= len(result["session_id"]) <= 128
+    ):
+      raise ProtocolError(
+        "invalid_response", "target revoke confirmation is invalid", 502
+      )
+    return result
 
   def exec(
     self,
