@@ -45,14 +45,28 @@ def request(client: TestClient, **overrides):
   )
 
 
+def revoke_request(client: TestClient, **overrides):
+  body = {
+    "target_url": MANAGED_TARGET_URL,
+    "target_token": TARGET_TOKEN,
+  }
+  body.update(overrides)
+  return client.post(
+    "/internal/target/revoke",
+    headers={"Authorization": f"Bearer {BOOTSTRAP}"},
+    json=body,
+  )
+
+
 def test_preflight_validates_recovery_target_without_retaining_secret(tmp_path) -> None:
   def target(call: httpx.Request) -> httpx.Response:
     assert call.headers["authorization"] == f"Bearer {TARGET_TOKEN}"
     return httpx.Response(200, json={
       "protocol": "mobius-recovery-target/v1",
-      "mode": "recovery",
+      "mode": "normal",
       "target": "mobius",
       "build_sha": "a" * 40,
+      "deployment_id": "deployment-123",
     })
 
   app = create_app(
@@ -68,9 +82,36 @@ def test_preflight_validates_recovery_target_without_retaining_secret(tmp_path) 
       "status": "ok",
       "protocol": "mobius-recovery-target/v1",
       "build_sha": "a" * 40,
+      "mode": "normal",
+      "deployment_id": "deployment-123",
     }
   assert not hasattr(app.state, "target_token")
   assert TARGET_TOKEN not in repr(app.state.__dict__)
+
+
+def test_preflight_preserves_legacy_managed_recovery_mode(tmp_path) -> None:
+  app = create_app(
+    settings(),
+    control_transport=httpx.MockTransport(lambda _request: httpx.Response(500)),
+    target_transport=httpx.MockTransport(
+      lambda _request: httpx.Response(200, json={
+        "protocol": "mobius-recovery-target/v1",
+        "mode": "recovery",
+        "target": "mobius",
+        "build_sha": "a" * 40,
+      })
+    ),
+    broker_path=tmp_path / "broker" / "target.sock",
+  )
+  with TestClient(app) as client:
+    response = request(client)
+  assert response.status_code == 200
+  assert response.json() == {
+    "status": "ok",
+    "protocol": "mobius-recovery-target/v1",
+    "build_sha": "a" * 40,
+    "mode": "recovery",
+  }
 
 
 def test_preflight_rejects_bad_bootstrap_and_public_ssrf_target(tmp_path) -> None:
@@ -117,11 +158,11 @@ def test_preflight_rejects_redirect_protocol_mismatch_and_wrong_mode(tmp_path) -
   responses = iter([
     httpx.Response(302, headers={"Location": "http://evil.invalid"}),
     httpx.Response(200, json={
-      "protocol": "old/v0", "mode": "recovery", "target": "mobius"
+      "protocol": "old/v0", "mode": "normal", "target": "mobius"
     }),
     httpx.Response(200, json={
       "protocol": "mobius-recovery-target/v1",
-      "mode": "normal",
+      "mode": "maintenance",
       "target": "mobius",
     }),
   ])
@@ -136,7 +177,154 @@ def test_preflight_rejects_redirect_protocol_mismatch_and_wrong_mode(tmp_path) -
     assert request(client).json()["error"]["code"] == "protocol_mismatch"
     wrong_mode = request(client)
     assert wrong_mode.status_code == 409
-    assert wrong_mode.json()["error"]["code"] == "target_not_recovery"
+    assert wrong_mode.json()["error"]["code"] == "target_mode_invalid"
+
+
+@pytest.mark.parametrize(
+  ("field", "value"),
+  [
+    ("build_sha", ""),
+    ("build_sha", "x" * 129),
+    ("deployment_id", None),
+    ("deployment_id", "x" * 129),
+  ],
+)
+def test_preflight_rejects_unbounded_target_identity(
+  tmp_path, field: str, value: object,
+) -> None:
+  health = {
+    "protocol": "mobius-recovery-target/v1",
+    "mode": "normal",
+    "target": "mobius",
+    "build_sha": "a" * 40,
+    "deployment_id": "deployment-123",
+  }
+  health[field] = value
+  app = create_app(
+    settings(),
+    control_transport=httpx.MockTransport(lambda _request: httpx.Response(500)),
+    target_transport=httpx.MockTransport(
+      lambda _request: httpx.Response(200, json=health)
+    ),
+    broker_path=tmp_path / "broker" / "target.sock",
+  )
+  with TestClient(app) as client:
+    response = request(client)
+  assert response.status_code == 502
+  assert response.json()["error"]["code"] == "invalid_response"
+  capability = TargetCapability(MANAGED_TARGET_URL, TARGET_TOKEN)
+  with pytest.raises(ProtocolError) as rejected:
+    app.state.preflight_bindings.consume(
+      capability,
+      hashlib.sha256(TARGET_TOKEN.encode("utf-8")).hexdigest(),
+    )
+  assert rejected.value.code == "unverified_target"
+
+
+def test_internal_revoke_returns_only_target_authenticated_identity(tmp_path) -> None:
+  calls: list[httpx.Request] = []
+
+  def target(call: httpx.Request) -> httpx.Response:
+    calls.append(call)
+    assert call.method == "POST"
+    assert call.url.path == "/v1/revoke"
+    assert call.headers["authorization"] == f"Bearer {TARGET_TOKEN}"
+    assert call.content == b"{}"
+    return httpx.Response(200, json={
+      "status": "revoked",
+      "deployment_id": "deployment-from-target",
+      "session_id": "session-from-target",
+    })
+
+  app = create_app(
+    settings(),
+    control_transport=httpx.MockTransport(lambda _request: httpx.Response(500)),
+    target_transport=httpx.MockTransport(target),
+    broker_path=tmp_path / "broker" / "target.sock",
+  )
+  with TestClient(app) as client:
+    response = revoke_request(client)
+  assert response.status_code == 200
+  assert response.json() == {
+    "status": "revoked",
+    "deployment_id": "deployment-from-target",
+    "session_id": "session-from-target",
+  }
+  assert len(calls) == 1
+
+  # Dashboard close must not create a one-use exchange preflight binding.
+  capability = TargetCapability(MANAGED_TARGET_URL, TARGET_TOKEN)
+  with pytest.raises(ProtocolError) as rejected:
+    app.state.preflight_bindings.consume(
+      capability,
+      hashlib.sha256(TARGET_TOKEN.encode("utf-8")).hexdigest(),
+    )
+  assert rejected.value.code == "unverified_target"
+
+
+def test_internal_revoke_rejects_bad_auth_ssrf_and_caller_identity(tmp_path) -> None:
+  calls = 0
+
+  def target(_request: httpx.Request) -> httpx.Response:
+    nonlocal calls
+    calls += 1
+    return httpx.Response(500)
+
+  app = create_app(
+    settings(),
+    control_transport=httpx.MockTransport(lambda _request: httpx.Response(500)),
+    target_transport=httpx.MockTransport(target),
+    broker_path=tmp_path / "broker" / "target.sock",
+  )
+  with TestClient(app) as client:
+    bad_auth = client.post(
+      "/internal/target/revoke",
+      headers={"Authorization": "Bearer wrong"},
+      json={"target_url": MANAGED_TARGET_URL, "target_token": TARGET_TOKEN},
+    )
+    assert bad_auth.status_code == 401
+    assert revoke_request(
+      client, target_url="http://169.254.169.254:18002"
+    ).status_code == 400
+    supplied_identity = revoke_request(
+      client,
+      deployment_id="caller-deployment",
+      session_id="caller-session",
+    )
+    assert supplied_identity.status_code == 400
+    assert supplied_identity.json()["error"]["code"] == "invalid_request"
+  assert calls == 0
+
+
+@pytest.mark.parametrize(
+  ("target_response", "expected_code"),
+  [
+    (
+      httpx.Response(200, json={
+        "status": "revoked",
+        "deployment_id": "deployment-only",
+      }),
+      "invalid_response",
+    ),
+    (
+      httpx.Response(200, content=b"x" * (16 * 1024 + 1)),
+      "response_too_large",
+    ),
+  ],
+)
+def test_internal_revoke_bounds_and_validates_target_confirmation(
+  tmp_path, target_response: httpx.Response, expected_code: str,
+) -> None:
+  app = create_app(
+    settings(),
+    control_transport=httpx.MockTransport(lambda _request: httpx.Response(500)),
+    target_transport=httpx.MockTransport(lambda _request: target_response),
+    broker_path=tmp_path / "broker" / "target.sock",
+  )
+  with TestClient(app) as client:
+    response = revoke_request(client)
+  assert response.status_code == 502
+  assert response.json()["error"]["code"] == expected_code
 
 
 @pytest.mark.parametrize(

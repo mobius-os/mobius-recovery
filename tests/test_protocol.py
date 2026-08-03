@@ -80,6 +80,37 @@ def test_core_health_contract_uses_protocol_key() -> None:
   assert client._client._trust_env is False
 
 
+def test_target_client_enforces_mode_policy_with_legacy_managed_compatibility() -> None:
+  def health(mode: str) -> httpx.MockTransport:
+    return httpx.MockTransport(lambda _request: httpx.Response(200, json={
+      "protocol": TARGET_PROTOCOL_VERSION,
+      "target": "mobius",
+      "mode": mode,
+    }))
+
+  live = TargetClient(
+    TargetCapability("http://target.internal", TOKEN),
+    allowed_modes=frozenset({"normal", "recovery"}),
+    transport=health("normal"),
+  )
+  assert live.health()["mode"] == "normal"
+
+  legacy_managed = TargetClient(
+    TargetCapability("http://target.internal", TOKEN),
+    allowed_modes=frozenset({"normal", "recovery"}),
+    transport=health("recovery"),
+  )
+  assert legacy_managed.health()["mode"] == "recovery"
+
+  legacy = TargetClient(
+    TargetCapability("http://target.internal", TOKEN),
+    transport=health("normal"),
+  )
+  with pytest.raises(ProtocolError) as rejected_legacy:
+    legacy.health()
+  assert rejected_legacy.value.code == "target_not_recovery"
+
+
 def test_protocol_mismatch_fails_closed() -> None:
   client = TargetClient(
     TargetCapability("http://target.internal", TOKEN),
@@ -195,3 +226,125 @@ def test_health_is_short_and_long_exec_gets_requested_timeout_grace() -> None:
   client.health()
   client.exec(["sleep", "300"], timeout_seconds=300)
   assert timeouts == [("/v1/health", 10.0), ("/v1/exec", 310.0)]
+
+
+def test_self_revoke_retries_one_ambiguous_response_and_returns_identity() -> None:
+  calls: list[httpx.Request] = []
+
+  def handler(request: httpx.Request) -> httpx.Response:
+    calls.append(request)
+    assert request.method == "POST"
+    assert request.url.path == "/v1/revoke"
+    assert request.headers["authorization"] == f"Bearer {TOKEN}"
+    assert json.loads(request.content) == {}
+    if len(calls) == 1:
+      raise httpx.ReadTimeout("revoke response was lost", request=request)
+    return httpx.Response(200, json={
+      "status": "revoked",
+      "deployment_id": "deployment-123",
+      "session_id": "session-456",
+    })
+
+  client = TargetClient(
+    TargetCapability("http://target.internal", TOKEN),
+    transport=httpx.MockTransport(handler),
+  )
+  try:
+    assert client.self_revoke() == {
+      "status": "revoked",
+      "deployment_id": "deployment-123",
+      "session_id": "session-456",
+    }
+  finally:
+    client.close()
+  assert len(calls) == 2
+  assert [call.extensions["timeout"]["read"] for call in calls] == [10.0, 10.0]
+
+
+@pytest.mark.parametrize(
+  "response",
+  [
+    {"status": "revoked"},
+    {
+      "status": "revoked",
+      "deployment_id": "deployment-123",
+      "session_id": "session-456",
+      "caller_supplied": "must-not-be-accepted",
+    },
+    {
+      "status": "ok",
+      "deployment_id": "deployment-123",
+      "session_id": "session-456",
+    },
+    {
+      "status": "revoked",
+      "deployment_id": "x" * 129,
+      "session_id": "session-456",
+    },
+    {
+      "status": "revoked",
+      "deployment_id": "deployment-123",
+      "session_id": "",
+    },
+  ],
+)
+def test_self_revoke_rejects_non_exact_or_unbounded_identity(response: dict) -> None:
+  calls = 0
+
+  def handler(_request: httpx.Request) -> httpx.Response:
+    nonlocal calls
+    calls += 1
+    return httpx.Response(200, json=response)
+
+  client = TargetClient(
+    TargetCapability("http://target.internal", TOKEN),
+    transport=httpx.MockTransport(handler),
+  )
+  try:
+    with pytest.raises(ProtocolError) as rejected:
+      client.self_revoke()
+  finally:
+    client.close()
+  assert rejected.value.code == "invalid_response"
+  assert calls == 1
+
+
+def test_self_revoke_response_has_a_small_independent_wire_limit() -> None:
+  client = TargetClient(
+    TargetCapability("http://target.internal", TOKEN),
+    transport=httpx.MockTransport(
+      lambda _request: httpx.Response(200, content=b"x" * (16 * 1024 + 1))
+    ),
+  )
+  try:
+    with pytest.raises(ProtocolError) as rejected:
+      client.self_revoke()
+  finally:
+    client.close()
+  assert rejected.value.code == "response_too_large"
+
+
+def test_self_revoke_does_not_retry_a_remote_error_with_transport_code() -> None:
+  calls = 0
+
+  def handler(_request: httpx.Request) -> httpx.Response:
+    nonlocal calls
+    calls += 1
+    return httpx.Response(503, json={
+      "error": {
+        "code": "target_unreachable",
+        "message": "declared by target",
+      }
+    })
+
+  client = TargetClient(
+    TargetCapability("http://target.internal", TOKEN),
+    transport=httpx.MockTransport(handler),
+  )
+  try:
+    with pytest.raises(ProtocolError) as rejected:
+      client.self_revoke()
+  finally:
+    client.close()
+  assert rejected.value.code == "target_unreachable"
+  assert calls == 1

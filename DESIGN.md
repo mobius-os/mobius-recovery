@@ -39,6 +39,10 @@ states. Streaming output appears in place without entrance choreography. The
 single authored motion is the target-status pulse while a session is connecting;
 it is disabled under `prefers-reduced-motion`.
 
+Finish freezes the incident workspace immediately. A managed live target is
+shown as closed only after its signed session revocation is confirmed; failure
+copy makes clear that local access remains closed and a fresh launch is needed.
+
 The visible page quietly maintains its ephemeral serverless session. If the
 worker restarts after inactivity, any stale authenticated page returns to a
 dedicated fresh-launch explanation; it never invites reuse of a consumed code.
