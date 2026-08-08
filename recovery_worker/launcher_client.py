@@ -22,6 +22,7 @@ is validated on a live Railway instance (see mobius.you
 from __future__ import annotations
 
 import base64
+from dataclasses import dataclass
 from typing import Any
 
 import httpx
@@ -30,6 +31,29 @@ from .protocol import MAX_FILE_BYTES, MAX_HTTP_RESPONSE_BYTES, ProtocolError
 
 RECOVERY_RPC_PATH = "/internal/recovery/op"
 REQUEST_TIMEOUT_SECONDS = 150.0
+
+
+@dataclass
+class LauncherTarget:
+  """Approach-2 analogue of ``TargetCapability``: what the exchange yields when
+  the transport is the launcher ssh RPC rather than the in-container daemon.
+
+  Carries only the launcher origin and the session capability — no Railway or
+  target credential. Mirrors the ``TargetCapability`` interface the session and
+  broker rely on: ``clear`` (wipe the sensitive capability, as sessions.py and
+  ExchangeResult.clear do) and ``build_client`` (the single place a
+  ``LauncherClient`` is constructed). Not frozen so ``clear`` can zero the
+  capability in place, matching ``TargetCapability.clear``.
+  """
+
+  launcher_url: str
+  session_capability: str
+
+  def clear(self) -> None:
+    self.session_capability = ""
+
+  def build_client(self, *, transport: httpx.BaseTransport | None = None) -> "LauncherClient":
+    return LauncherClient(self.launcher_url, self.session_capability, transport=transport)
 
 
 class LauncherClient:

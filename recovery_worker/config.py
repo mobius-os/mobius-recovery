@@ -61,6 +61,11 @@ class Settings:
   local_target_url: str | None
   local_target_token: str | None
   local_token: str | None
+  # Approach-2 transport flag (DRAFT, default off). When enabled in managed
+  # mode, the exchange yields a LauncherTarget and repairs run over the
+  # launcher's ssh RPC instead of the in-container target daemon. Off = the
+  # legacy target-capability path, byte-for-byte unchanged.
+  launcher_transport: bool = False
 
   @property
   def managed(self) -> bool:
@@ -89,6 +94,9 @@ class Settings:
       local_token=os.environ.get(
         "MOBIUS_RECOVERY_LOCAL_TOKEN", ""
       ).strip() or None,
+      launcher_transport=os.environ.get(
+        "MOBIUS_RECOVERY_LAUNCHER_TRANSPORT", "0"
+      ).lower() in {"1", "true", "yes"},
     )
     settings.validate()
     return settings

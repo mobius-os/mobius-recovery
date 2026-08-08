@@ -27,6 +27,7 @@ from .chat import (
 from .broker import BROKER_SOCKET, TargetBroker
 from .config import WORKER_PROTOCOL_VERSION, Settings
 from .control import ControlClient
+from .launcher_client import LauncherTarget
 from .pages import closed_page, login_page, lost_page, recovery_page
 from .preflight import PreflightBindings, managed_target_url
 from .protocol import ProtocolError, TargetCapability
@@ -45,10 +46,18 @@ MAX_BROWSER_SESSION_SECONDS = 60 * 60
 
 
 def _target_health(
-  capability: TargetCapability,
+  capability,
   transport: httpx.BaseTransport | None,
   allowed_modes: frozenset[str],
 ) -> dict:
+  # Approach 2 (draft): health goes over the launcher ssh RPC. Default path
+  # (a TargetCapability) is unchanged.
+  if isinstance(capability, LauncherTarget):
+    client = capability.build_client(transport=transport)
+    try:
+      return client.health()
+    finally:
+      client.close()
   target = TargetClient(
     capability,
     allowed_modes=allowed_modes,
@@ -61,11 +70,15 @@ def _target_health(
 
 
 def _target_self_revoke(
-  capability: TargetCapability,
+  capability,
   transport: httpx.BaseTransport | None,
   allowed_modes: frozenset[str],
 ) -> dict[str, str]:
   """Use one fixed controller-supplied capability to revoke its own target sid."""
+  # Approach 2 has no standing target capability to revoke — ssh access ends
+  # with the session — so this is a no-op that preserves the response contract.
+  if isinstance(capability, LauncherTarget):
+    return {"status": "revoked"}
   target = TargetClient(
     capability,
     allowed_modes=allowed_modes,
