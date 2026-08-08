@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Any
 
 from .config import STATE_DIR
+from .launcher_client import LauncherTarget
 from .protocol import MAX_FILE_BYTES, ProtocolError, TargetCapability
 from .target_client import TargetClient, validate_fs_path
 
@@ -192,11 +193,17 @@ class TargetBroker:
     if self._expires_at.tzinfo is None:
       raise ValueError("broker expiry must be timezone-aware")
     self._on_expire = on_expire
-    self._target = TargetClient(
-      capability,
-      allowed_modes=allowed_modes,
-      transport=transport,
-    )
+    # Approach 2 (draft): a LauncherTarget builds a LauncherClient that forwards
+    # ops to the launcher ssh RPC. The default path (a TargetCapability) is
+    # unchanged. Both expose the same operation surface the dispatch below uses.
+    if isinstance(capability, LauncherTarget):
+      self._target = capability.build_client(transport=transport)
+    else:
+      self._target = TargetClient(
+        capability,
+        allowed_modes=allowed_modes,
+        transport=transport,
+      )
     self._server = _UnixServer(str(self._path), self._target, self._expires_at)
     self._path.chmod(0o600)
     self._thread = threading.Thread(

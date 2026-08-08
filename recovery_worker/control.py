@@ -12,6 +12,7 @@ from urllib.parse import urlparse
 import httpx
 
 from .config import WORKER_PROTOCOL_VERSION, Settings
+from .launcher_client import LauncherTarget
 from .protocol import ProtocolError, TargetCapability, parse_expiry
 
 
@@ -22,7 +23,7 @@ CONTROL_RETRY_BACKOFF_SECONDS = 0.1
 @dataclass
 class ExchangeResult:
   session_id: str
-  target: TargetCapability
+  target: TargetCapability | LauncherTarget
   session_capability: str
   expires_at: datetime
 
@@ -205,9 +206,18 @@ class ControlClient:
       raise ProtocolError("invalid_exchange", "session id is missing")
     if not isinstance(capability, str) or len(capability) < 32:
       raise ProtocolError("invalid_exchange", "session capability is missing")
-    target = TargetCapability.parse(data.get("target_url"), data.get("target_token"))
     expires_at = parse_expiry(data.get("expires_at"))
-    self._target_validator(target, data.get("target_token_sha256"))
+    if self._settings.launcher_transport:
+      # Approach 2 (draft): repairs run over the launcher's ssh RPC, so the
+      # exchange yields no target daemon URL/token — only the session
+      # capability, used as the launcher RPC bearer.
+      target = LauncherTarget(
+        launcher_url=self._settings.control_plane_url or "",
+        session_capability=capability,
+      )
+    else:
+      target = TargetCapability.parse(data.get("target_url"), data.get("target_token"))
+      self._target_validator(target, data.get("target_token_sha256"))
     return ExchangeResult(
       session_id=session_id,
       target=target,
@@ -285,11 +295,17 @@ class ControlClient:
           raise ProtocolError(
             "invalid_control_response", "finish next generation is invalid"
           )
-        target = TargetCapability.parse(
-          data.get("target_url"), data.get("target_token")
-        )
         expires_at = parse_expiry(data.get("expires_at"))
-        self._target_validator(target, data.get("target_token_sha256"))
+        if self._settings.launcher_transport:
+          target = LauncherTarget(
+            launcher_url=self._settings.control_plane_url or "",
+            session_capability=exchange.session_capability,
+          )
+        else:
+          target = TargetCapability.parse(
+            data.get("target_url"), data.get("target_token")
+          )
+          self._target_validator(target, data.get("target_token_sha256"))
       elif status == "resumed":
         raise ProtocolError(
           "invalid_control_response", "finish resume result is invalid"
