@@ -91,19 +91,18 @@ def _document(title: str, body: str, nonce: str, script: str = "") -> str:
 <style nonce="{html.escape(nonce)}">{_STYLE}</style></head><body>{body}{script_tag}</body></html>"""
 
 
-def login_page(nonce: str, *, instance_id: str = "", error: str = "") -> str:
+def launch_page(nonce: str, *, error: str = "", return_url: str | None) -> str:
   error_html = f'<p class="error" role="alert">{html.escape(error)}</p>' if error else ""
-  instance = (
-    f'<input type="hidden" name="instance_id" value="{html.escape(instance_id, quote=True)}">'
-    if instance_id else ""
+  action = (
+    f'<a class="button" href="{html.escape(return_url, quote=True)}">'
+    "Return to Mobius</a>"
+    if return_url else ""
   )
   body = f"""<main class="start"><div class="start-main"><div class="mark" aria-hidden="true">∞</div>
 <h1>Repair from outside.</h1><p class="lede">This temporary worker is separate from your Mobius instance.
 Its code cannot be changed by the recovery agent, and its repair capability is fixed to one target.</p>
-{error_html}<form class="stack" method="post" action="/session/start">
-{instance}<div><label for="code">One-time recovery code</label><input class="input" id="code" name="code"
-required autocomplete="one-time-code" autofocus></div><button class="button" type="submit">Start recovery</button>
-</form></div></main>"""
+{error_html}<p class="lede">Open Recovery from mobius.you to create a fresh one-time handoff.</p>
+{action}</div></main>"""
   return _document("Mobius Recovery", body, nonce)
 
 
@@ -123,26 +122,18 @@ def lost_page(nonce: str, *, return_url: str | None) -> str:
 def closed_page(
   nonce: str,
   *,
-  local: bool,
   outcome: str,
   return_url: str | None,
 ) -> str:
   if outcome == "recovered":
     title = "Recovery finished."
     detail = (
-      "The temporary capability is closed. Run "
-      "scripts/mobiusctl recovery finish to restart Mobius and remove the "
-      "local recovery containers. This worker cannot control Docker by design."
-      if local else
-      "The temporary capability is closed. Mobius is starting normally and "
-      "mobius.you is checking its health."
+      "The temporary capability is closed. Möbius kept running in place while "
+      "you worked, and mobius.you is removing this recovery worker."
     )
   else:
     title = "Recovery session cancelled."
     detail = (
-      "The temporary capability is closed. Run scripts/mobiusctl recovery "
-      "finish to leave recovery mode and restart Mobius."
-      if local else
       "The temporary capability is closed. Return to mobius.you when you are "
       "ready to start another recovery."
     )
@@ -163,7 +154,6 @@ def recovery_page(
   protocol_version: str,
   build_sha: str,
   session_id: str,
-  generation: int,
   readiness_error: str | None = None,
   finishing: bool = False,
   finish_result=None,
@@ -197,15 +187,12 @@ def recovery_page(
 </div></form></div></section></main>
 <dialog id="provider-dialog"><h2 id="dialog-title">Connect provider</h2><div id="dialog-body"></div>
 <div class="dialog-actions"><button class="button secondary" id="dialog-close" type="button">Close</button></div></dialog>
-<dialog id="finish-dialog"><h2>Finish this recovery?</h2><p class="lede">Mobius will verify normal startup and close this temporary capability.</p>
+<dialog id="finish-dialog"><h2>Finish this recovery?</h2><p class="lede">Möbius will keep running in place. This closes the temporary capability and removes the recovery worker.</p>
 <div class="dialog-actions"><button class="button secondary" data-finish-close type="button">Keep working</button>
 <button class="button" data-finish-confirm type="button">Finish recovery</button></div></dialog>"""
   script = _SCRIPT.replace(
     "const initialFinishing=false;",
     f"const initialFinishing={'true' if finishing else 'false'};",
-  ).replace(
-    "const initialGeneration=1;",
-    f"const initialGeneration={generation};",
   )
   return _document("Repair · Mobius Recovery", body, nonce, script)
 
@@ -214,7 +201,6 @@ _SCRIPT = r"""
 history.replaceState(null,'','/');
 const $=s=>document.querySelector(s), messages=$('#messages'), empty=$('#empty');
 const initialFinishing=false;
-const initialGeneration=1;
 let busy=false,finishing=initialFinishing,finishTimer;
 function setBusy(value){busy=value;const disabled=value||finishing;$('#send').disabled=disabled;$('#message').disabled=disabled;$('#finish').disabled=disabled;$('#cancel').disabled=disabled;
  $('#finish').title=value?'Wait for the active recovery turn to finish.':'';$('#cancel').title=$('#finish').title}
@@ -262,7 +248,7 @@ function handleFinish(data){if(data.status==='finished'){location.replace('/');r
  clearTimeout(finishTimer);finishTimer=setTimeout(pollFinish,1200)}
 async function pollFinish(){if(!finishing)return;try{handleFinish(await api('/api/finish/status'))}catch(e){if(redirectLost(e))return;
  $('#target-status').textContent='Still waiting for finish status · '+e.message;finishTimer=setTimeout(pollFinish,1800)}}
-async function finish(outcome){enterFinishing();try{handleFinish(await api('/api/finish',{method:'POST',body:JSON.stringify({outcome,generation:initialGeneration})}))}
+async function finish(outcome){enterFinishing();try{handleFinish(await api('/api/finish',{method:'POST',body:JSON.stringify({outcome})}))}
  catch(e){if(redirectLost(e))return;if(e.status&&e.status<500){finishing=false;setBusy(false);alert(e.message)}else{
  $('#target-status').textContent='Confirming finish status…';finishTimer=setTimeout(pollFinish,1200)}}}
 $('[data-finish-confirm]').onclick=()=>finish('recovered');$('#cancel').onclick=()=>{if(confirm('Cancel this recovery session?'))finish('cancelled')};

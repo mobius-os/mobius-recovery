@@ -16,8 +16,7 @@ ARG VCS_REF=development
 ARG VERSION=1.0.0
 ARG TARGETARCH=amd64
 
-# The paired Mobius target image is currently amd64-only. Fail at build time
-# instead of publishing an ARM worker that cannot recover an ARM target.
+# Provider CLI packages currently publish the pinned amd64 binaries below.
 RUN test "$TARGETARCH" = "amd64"
 
 LABEL org.opencontainers.image.title="Mobius Recovery Worker" \
@@ -49,13 +48,13 @@ RUN pip install --no-cache-dir --require-hashes \
     && chmod 0700 /state
 
 COPY recovery_worker /app/recovery_worker
-COPY bin/mobius-target /usr/local/bin/mobius-target
+COPY bin/mobius-ssh /usr/local/bin/mobius-ssh
 COPY VERSION /app/VERSION
 
 # Build identity is created inside the image and is never read from runtime env.
 RUN case "$VCS_REF" in (*[!A-Za-z0-9._:-]*|'') exit 2;; esac \
     && printf '%s\n' "$VCS_REF" > /app/BUILD_REVISION \
-    && chmod 0555 /usr/local/bin/mobius-target \
+    && chmod 0555 /usr/local/bin/mobius-ssh \
     && find /app -type d -exec chmod 0555 {} + \
     && find /app -type f -exec chmod 0444 {} + \
     && find / -xdev -type f -perm /6000 -exec chmod a-s {} + \

@@ -41,7 +41,7 @@ docker run --rm --entrypoint /bin/sh "$image" -c '
 # Exercise the installed launcher, not a host checkout. The first session
 # leaves project memory behind; the workspace manager must delete it. The
 # second writable cwd deliberately shadows recovery_worker, and -I plus the
-# fixed /app import must still select the root-owned client with correct argv.
+# fixed /app import must still select the root-owned command client.
 docker run --rm --entrypoint python "$image" -c '
 import json
 import os
@@ -59,7 +59,7 @@ first = spaces.create()
 poison = first / "recovery_worker"
 poison.mkdir()
 (poison / "__init__.py").write_text("raise SystemExit(91)\n", encoding="utf-8")
-(poison / "target_client.py").write_text("raise SystemExit(92)\n", encoding="utf-8")
+(poison / "command_cli.py").write_text("raise SystemExit(92)\n", encoding="utf-8")
 (first / "CLAUDE.md").write_text("old-session-memory\n", encoding="utf-8")
 
 second = spaces.create()
@@ -68,7 +68,7 @@ assert not first.exists()
 poison = second / "recovery_worker"
 poison.mkdir()
 (poison / "__init__.py").write_text("raise SystemExit(93)\n", encoding="utf-8")
-(poison / "target_client.py").write_text("raise SystemExit(94)\n", encoding="utf-8")
+(poison / "command_cli.py").write_text("raise SystemExit(94)\n", encoding="utf-8")
 
 broker_path = pathlib.Path("/state/image-test-broker.sock")
 try:
@@ -86,15 +86,11 @@ def serve():
     while not raw.endswith(b"\n"):
       raw += connection.recv(4096)
     request = json.loads(raw)
-    assert request == {"operation": "health", "args": {}}
+    assert request["operation"] == "exec"
+    assert request["args"]["argv"] == ["/usr/bin/id", "-u"]
     connection.sendall(json.dumps({
       "ok": True,
-      "result": {
-        "status": "ready",
-        "protocol": "mobius-recovery-target/v1",
-        "target": "mobius",
-        "mode": "recovery",
-      },
+      "result": {"stdout_base64": "MAo=", "stderr_base64": "", "exit_code": 0},
     }).encode() + b"\n")
   listener.close()
 
@@ -103,7 +99,7 @@ server.start()
 environment = os.environ.copy()
 environment["MOBIUS_RECOVERY_BROKER_SOCKET"] = str(broker_path)
 result = subprocess.run(
-  ["/usr/local/bin/mobius-target", "health"],
+  ["/usr/local/bin/mobius-ssh", "--", "/usr/bin/id", "-u"],
   cwd=second,
   env=environment,
   text=True,
@@ -113,7 +109,7 @@ result = subprocess.run(
 server.join(10)
 assert not server.is_alive()
 assert result.returncode == 0, (result.stdout, result.stderr)
-assert json.loads(result.stdout)["status"] == "ready"
+assert result.stdout == "0\n"
 assert "SystemExit" not in result.stderr
 '
 
