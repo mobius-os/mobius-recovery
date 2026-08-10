@@ -20,7 +20,7 @@ def _decode(value: object) -> bytes:
 def main(argv: list[str] | None = None) -> int:
   parser = argparse.ArgumentParser(
     prog="mobius-ssh",
-    description="Run a command as root in the Mobius instance bound to this session.",
+    description="Run a command as root in the Möbius instance bound to this session.",
   )
   parser.add_argument("--cwd")
   parser.add_argument("--timeout", type=int, default=120)

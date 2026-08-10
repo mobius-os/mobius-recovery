@@ -33,8 +33,8 @@ _running = False
 _finishing = False
 
 
-SYSTEM_PROMPT = """You are the Mobius recovery agent. The owner opened this
-separate worker because their Mobius target may be broken. Diagnose carefully,
+SYSTEM_PROMPT = """You are the Möbius recovery agent. The owner opened this
+separate worker because their Möbius target may be broken. Diagnose carefully,
 make the smallest correct repair, verify it, and explain what changed.
 
 You are NOT running inside the target. Your local container is an immutable,
