@@ -1,77 +1,22 @@
 # Product
 
-<!-- impeccable:product-schema 1 -->
+## Purpose
 
-## Platform
+Mobius Recovery gives the owner a temporary AI-assisted shell into one managed
+Mobius instance when its normal interface is unavailable.
 
-web
+## Principles
 
-## Users
+- Never restart, redeploy, reconfigure, or write recovery state into Mobius.
+- Create the recovery worker only on demand and remove it when the session ends.
+- Bind authority in mobius.you; the worker and model cannot select a target.
+- Keep Railway OAuth and SSH credentials in the launcher.
+- Expose one familiar remote primitive—command execution over native SSH.
+- Treat remote output as untrusted data and prefer reversible repairs.
+- Fail closed on expiry, replay, identity drift, redirects, or oversized data.
 
-The primary user is the owner of a managed or self-hosted Mobius instance that
-is unavailable or damaged. They need to diagnose and repair their own instance
-while its normal interface and agent may be unusable.
+## User flow
 
-## Product Purpose
-
-Mobius Recovery provides an independently deployed AI repair session with a
-full-power capability fixed to one target. Success means the owner can repair
-and verify that target without giving the recovery agent any way to edit or
-redeploy the recovery worker itself.
-
-## Positioning
-
-The worker combines an immutable, unprivileged control surface with a
-short-lived, target-bound repair capability. Privilege exists only across the
-versioned target protocol, never in the worker container.
-
-## Operating Context
-
-Managed sessions are opened from mobius.you and run in a sleeping Railway
-service inside the instance's project. Self-hosted sessions use the same image,
-a locally generated one-time token, and a private repair target. The owner may
-need to reconnect Claude or Codex during the incident. Every managed open
-force-deploys the approved immutable digest; every self-hosted open pulls
-`stable` and recreates the worker with a fresh `/state` tmpfs. An arbitrary
-process restart is session invalidation, not the freshness mechanism.
-
-## Capabilities and Constraints
-
-- One-time owner authentication and an expiring browser session.
-- Claude and Codex provider login and recovery chat.
-- Remote health, command, read, write, and list operations through
-  `mobius-recovery-target/v1`.
-- No agent-facing target selector. An authenticated controller-only
-  `/internal/target/verify` route binds the exact managed target before launch,
-  and the narrow finish callback cannot select or mutate the recovery service.
-- No Railway token, Docker socket, sudo, setuid program, persistent code, or
-  self-update mechanism in the worker.
-- Provider credentials and chat history are ephemeral. Same-uid
-  model-controlled tools can read their own provider CLI's OAuth credential, so
-  recovery should use a dedicated, short-lived, narrowly scoped, revocable
-  authorization and wipe/revoke it after the incident. Target, bootstrap,
-  Railway, and control-plane credentials remain outside that provider boundary.
-- A visible managed recovery page keeps its in-memory worker awake; hidden or
-  closed pages permit sleep, and a restarted process requires a fresh launch.
-
-## Brand Commitments
-
-Use the Mobius name, direct incident-focused language, and the restrained
-neutral shell with purple accent established by the main product.
-
-## Evidence on Hand
-
-The repository contains the executable protocol client and security tests.
-There are no customer claims, benchmarks, or recovery guarantees to present.
-
-## Product Principles
-
-- Preserve the owner's agency while making every repair reversible.
-- Keep privilege in the target capability, outside the recovery worker.
-- Name current state and the next action plainly during an incident.
-- Fail closed on stale, replayed, mismatched, or oversized protocol data.
-
-## Accessibility & Inclusion
-
-The recovery flow must remain keyboard usable, screen-reader legible, responsive
-on phones, and respectful of reduced-motion preferences.
+The owner opens Recovery from mobius.you, connects Claude or Codex, describes
+the incident, reviews the repair, and finishes the session. A lost worker simply
+requires a fresh launch and has no effect on the Mobius deployment.

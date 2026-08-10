@@ -36,7 +36,7 @@ class _Response:
 
 def test_provider_environment_excludes_worker_and_proxy_secrets(monkeypatch) -> None:
   monkeypatch.setenv("MOBIUS_RECOVERY_BOOTSTRAP_SECRET", "bootstrap-secret")
-  monkeypatch.setenv("MOBIUS_RECOVERY_TARGET_TOKEN", "target-secret")
+  monkeypatch.setenv("MOBIUS_RECOVERY_BOOTSTRAP_SECRET", "bootstrap-secret")
   monkeypatch.setenv("MOBIUS_RECOVERY_CONTROL_PLANE_URL", "https://control")
   monkeypatch.setenv("HTTP_PROXY", "http://proxy.invalid")
   monkeypatch.setenv("PATH", "/usr/local/bin:/usr/bin")
