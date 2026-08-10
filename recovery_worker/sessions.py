@@ -38,7 +38,6 @@ class RecoverySession:
   messages: list[Message] = field(default_factory=list)
   readiness_error: str | None = None
   finish_outcome: str | None = None
-  finish_result: None = None
   provider_generation: int | None = None
   workspace: Path | None = None
   _history_chars: int = field(default=0, init=False, repr=False)
@@ -46,10 +45,6 @@ class RecoverySession:
   _revoked: bool = field(default=False, init=False, repr=False)
   _revoke_lock: threading.Lock = field(default_factory=threading.Lock, init=False, repr=False)
   _finish_lock: threading.Lock = field(default_factory=threading.Lock, init=False, repr=False)
-
-  @property
-  def managed_exchange(self) -> ExchangeResult:
-    return self.exchange
 
   @property
   def finishing(self) -> bool:

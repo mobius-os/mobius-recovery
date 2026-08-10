@@ -7,12 +7,15 @@ from datetime import datetime, timedelta, timezone
 
 import httpx
 import pytest
+from fastapi.testclient import TestClient
 
+import recovery_worker.app as app_module
 from recovery_worker.broker import CommandBroker, broker_request
+from recovery_worker.app import create_app
 from recovery_worker.config import Settings, WORKER_PROTOCOL_VERSION
 from recovery_worker.control import ControlClient, ExchangeResult
 from recovery_worker.protocol import ProtocolError
-from recovery_worker.sessions import SessionStore
+from recovery_worker.sessions import COOKIE_NAME, SessionStore
 
 
 ORIGIN = "https://mobius.example"
@@ -171,3 +174,93 @@ def test_exec_relay_uses_capability_and_has_no_target_selector() -> None:
   assert request.url.path == "/internal/recovery/exec"
   assert request.headers["authorization"] == f"Bearer {CAPABILITY}"
   assert json.loads(request.content) == {"argv": ["true"]}
+
+
+def test_failed_post_exchange_probe_keeps_a_closable_browser_session(
+  tmp_path, monkeypatch,
+) -> None:
+  paths = []
+
+  def transport(request: httpx.Request) -> httpx.Response:
+    paths.append(request.url.path)
+    if request.url.path == "/recovery/exchange":
+      return httpx.Response(200, json=exchange_payload())
+    if request.url.path == "/recovery/exchange/ack":
+      return httpx.Response(200, json={"status": "acknowledged"})
+    if request.url.path == "/internal/recovery/exec":
+      return httpx.Response(502, json={
+        "error": {"message": "Railway SSH is temporarily unavailable"},
+      })
+    if request.url.path == "/recovery/finish":
+      return httpx.Response(200, json={
+        "status": "finished", "outcome": "cancelled",
+      })
+    raise AssertionError(request.url.path)
+
+  monkeypatch.setattr(app_module, "harden_process", lambda: None)
+  app = create_app(
+    settings(),
+    control_transport=httpx.MockTransport(transport),
+    broker_path=tmp_path / "broker" / "command.sock",
+    workspace_root=tmp_path / "workspaces",
+  )
+  with TestClient(app, base_url="https://worker.example") as client:
+    started = client.post(
+      "/session/start",
+      data={"code": "one-time", "instance_id": "mob_instance-1"},
+      headers={"Origin": ORIGIN, "Sec-Fetch-Site": "cross-site"},
+    )
+    assert started.status_code == 200
+    assert "Railway SSH is temporarily unavailable" in started.text
+    assert COOKIE_NAME in client.cookies
+
+    blocked = client.get("/api/providers")
+    assert blocked.status_code == 503
+    assert blocked.json()["error"]["code"] == "target_unavailable"
+
+    finished = client.post(
+      "/api/finish",
+      json={"outcome": "cancelled"},
+      headers={
+        "Origin": "https://worker.example",
+        "Sec-Fetch-Site": "same-origin",
+      },
+    )
+    assert finished.status_code == 200
+    assert finished.json() == {"status": "finished", "outcome": "cancelled"}
+
+  assert paths[-1] == "/recovery/finish"
+
+
+def test_unexpected_post_exchange_failure_keeps_an_authenticated_page(
+  tmp_path, monkeypatch,
+) -> None:
+  def fail_activate(_session) -> None:
+    raise RuntimeError("internal detail")
+
+  def transport(request: httpx.Request) -> httpx.Response:
+    if request.url.path == "/recovery/exchange":
+      return httpx.Response(200, json=exchange_payload())
+    if request.url.path == "/recovery/exchange/ack":
+      return httpx.Response(200, json={"status": "acknowledged"})
+    raise AssertionError(request.url.path)
+
+  monkeypatch.setattr(app_module, "harden_process", lambda: None)
+  app = create_app(
+    settings(),
+    control_transport=httpx.MockTransport(transport),
+    broker_path=tmp_path / "broker" / "command.sock",
+    workspace_root=tmp_path / "workspaces",
+  )
+  monkeypatch.setattr(app.state.runtime, "activate", fail_activate)
+  with TestClient(app, base_url="https://worker.example") as client:
+    started = client.post(
+      "/session/start",
+      data={"code": "one-time", "instance_id": "mob_instance-1"},
+      headers={"Origin": ORIGIN, "Sec-Fetch-Site": "cross-site"},
+    )
+
+  assert started.status_code == 200
+  assert COOKIE_NAME in started.cookies
+  assert "could not prepare the target connection" in started.text
+  assert "internal detail" not in started.text
