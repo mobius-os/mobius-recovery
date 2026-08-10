@@ -1,10 +1,10 @@
-# Mobius Recovery Worker
+# Möbius Recovery worker
 
-Mobius Recovery is a temporary, unprivileged web process for repairing one
-managed Mobius instance. Mobius itself does not run a recovery daemon. The
+Möbius Recovery is a temporary, unprivileged web process for repairing one
+managed Möbius instance. Möbius itself does not run a recovery daemon. The
 worker sends commands to mobius.you, which executes them through Railway's
-native SSH endpoint using the owner's OAuth connection and a launcher-held SSH
-key.
+native Secure Shell (SSH) endpoint using the owner's OAuth connection and a
+launcher-held SSH key.
 
 ## Trust boundary
 
@@ -13,7 +13,9 @@ key.
 - The capability is bound server-side to one instance, service instance, and
   deployment. The worker cannot supply or change any of those identifiers.
 - Provider subprocesses see only a mode-`0600` Unix socket with one operation:
-  execute a command in the bound Mobius container.
+  execute a command in the bound Möbius container.
+- Provider credentials and chat state exist only on the worker's ephemeral
+  filesystem. Finish refuses to report success if credential removal fails.
 - Railway OAuth tokens, SSH keys, and the session capability remain in parent
   processes. They are never passed to Claude or Codex.
 - The worker runs as uid/gid `10001:10001`, has immutable application code,
@@ -35,7 +37,7 @@ Railway's SSH host key.
 
 1. mobius.you verifies the owner's OAuth connection has `ssh_keys`, registers a
    per-connection public key, and creates a fresh worker service.
-2. The launcher verifies root access to the exact current Mobius service
+2. The launcher verifies root access to the exact current Möbius service
    instance without restarting or changing that service.
 3. The browser exchanges its one-time handoff with the worker. The worker keeps
    its short-lived command capability in memory and starts the local socket.
@@ -44,7 +46,7 @@ Railway's SSH host key.
 
 There is no recovery boot mode, target protocol, crash-loop counter, recovery
 volume mutation, or resume generation. If a worker disappears, open Recovery
-again; Mobius continues running unchanged.
+again; Möbius continues running unchanged.
 
 ## Configuration
 
