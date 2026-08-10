@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+import logging
 import secrets
 import threading
 from contextlib import asynccontextmanager
@@ -39,6 +40,7 @@ MAX_START_BODY = 16 * 1024
 CLOSED_COOKIE = "mobius_recovery_closed"
 SSE_KEEPALIVE_SECONDS = 15.0
 MAX_BROWSER_SESSION_SECONDS = 60 * 60
+LOGGER = logging.getLogger(__name__)
 
 
 class RecoveryRuntime:
@@ -112,6 +114,10 @@ class RecoveryRuntime:
 
   def quiesce(self, session: RecoverySession) -> None:
     self.revoke(session, "finishing")
+
+  def active_for(self, session: RecoverySession) -> bool:
+    with self._lock:
+      return bool(self._active and self._active[0] == session.session_id)
 
   def close(self) -> None:
     with self._lock:
@@ -325,6 +331,8 @@ def create_app(
     token, session = await current(request)
     if session.finishing or finish_active():
       raise ProtocolError("finish_in_progress", "Recovery is already closing.", 409)
+    if session.readiness_error:
+      raise ProtocolError("target_unavailable", session.readiness_error, 503)
     return token, session
 
   @app.get("/health")
@@ -368,16 +376,27 @@ def create_app(
       browser_token, session = await asyncio.to_thread(
         sessions.start, form.get("code", ""), form.get("instance_id") or None
       )
-      await asyncio.to_thread(runtime.activate, session)
-      await asyncio.to_thread(_target_ready, control, session)
-      session.readiness_error = None
     except ProtocolError as exc:
       body = launch_page(
         nonce, error=exc.message, return_url=settings.control_plane_url
       )
       return _security_headers(HTMLResponse(body, status_code=exc.status), nonce)
-    except OSError:
-      session.readiness_error = "The local command broker could not start."
+    try:
+      await asyncio.to_thread(runtime.activate, session)
+      await asyncio.to_thread(_target_ready, control, session)
+      session.readiness_error = None
+    except ProtocolError as exc:
+      # The one-time exchange already activated the launcher grant. Keep the
+      # browser session reachable so the owner can retry the probe or close it;
+      # returning an anonymous launch page here would strand the worker until
+      # the server-side expiry job eventually deleted it.
+      session.readiness_error = exc.message
+    except Exception:
+      # No post-exchange setup failure may discard the only browser handle for
+      # an active grant. Keep the detailed exception out of the response, but
+      # retain an authenticated page from which the owner can cancel safely.
+      LOGGER.exception("Recovery runtime setup failed after exchange")
+      session.readiness_error = "The recovery worker could not prepare the target connection."
     body = recovery_page(
       nonce, protocol_version=WORKER_PROTOCOL_VERSION,
       build_sha=settings.build_sha, session_id=session.session_id,
@@ -398,8 +417,15 @@ def create_app(
 
   @app.get("/api/target/health")
   async def target_health(request: Request):
-    _, session = await interactive(request)
+    _, session = await current(request)
+    if session.finishing or finish_active():
+      raise ProtocolError("finish_in_progress", "Recovery is already closing.", 409)
+    if not await asyncio.to_thread(runtime.active_for, session):
+      raise ProtocolError(
+        "broker_unavailable", "The local command broker is unavailable.", 503
+      )
     result = await asyncio.to_thread(_target_ready, control, session)
+    session.readiness_error = None
     return _security_headers(JSONResponse({"status": "ready", "target": result}))
 
   @app.post("/api/providers/claude/start")

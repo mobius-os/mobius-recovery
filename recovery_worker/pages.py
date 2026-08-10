@@ -156,13 +156,11 @@ def recovery_page(
   session_id: str,
   readiness_error: str | None = None,
   finishing: bool = False,
-  finish_result=None,
 ) -> str:
   facts = {"protocol": protocol_version, "build": build_sha, "session": session_id}
-  finish_error = getattr(finish_result, "error_message", None)
   dot_class = "dot pending" if readiness_error or finishing else "dot"
   target_text = (
-    finish_error or "Finishing recovery…"
+    "Finishing recovery…"
     if finishing else readiness_error or "Connected to one repair target"
   )
   body = f"""<main class="shell"><aside class="rail"><div class="brand"><div class="mark" aria-hidden="true">∞</div>
