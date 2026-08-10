@@ -19,7 +19,7 @@ ARG TARGETARCH=amd64
 # Provider CLI packages currently publish the pinned amd64 binaries below.
 RUN test "$TARGETARCH" = "amd64"
 
-LABEL org.opencontainers.image.title="Mobius Recovery Worker" \
+LABEL org.opencontainers.image.title="Möbius Recovery Worker" \
       org.opencontainers.image.source="https://github.com/mobius-os/mobius-recovery" \
       org.opencontainers.image.version="${VERSION}" \
       org.opencontainers.image.revision="${VCS_REF}"

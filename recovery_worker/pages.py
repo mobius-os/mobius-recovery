@@ -95,15 +95,15 @@ def launch_page(nonce: str, *, error: str = "", return_url: str | None) -> str:
   error_html = f'<p class="error" role="alert">{html.escape(error)}</p>' if error else ""
   action = (
     f'<a class="button" href="{html.escape(return_url, quote=True)}">'
-    "Return to Mobius</a>"
+    "Return to Möbius</a>"
     if return_url else ""
   )
   body = f"""<main class="start"><div class="start-main"><div class="mark" aria-hidden="true">∞</div>
-<h1>Repair from outside.</h1><p class="lede">This temporary worker is separate from your Mobius instance.
+<h1>Repair from outside.</h1><p class="lede">This temporary worker is separate from your Möbius instance.
 Its code cannot be changed by the recovery agent, and its repair capability is fixed to one target.</p>
 {error_html}<p class="lede">Open Recovery from mobius.you to create a fresh one-time handoff.</p>
 {action}</div></main>"""
-  return _document("Mobius Recovery", body, nonce)
+  return _document("Möbius Recovery", body, nonce)
 
 
 def lost_page(nonce: str, *, return_url: str | None) -> str:
@@ -112,11 +112,11 @@ def lost_page(nonce: str, *, return_url: str | None) -> str:
   if return_url:
     action = (
       f'<a class="button" href="{html.escape(return_url, quote=True)}">'
-      "Return to Mobius</a>"
+      "Return to Möbius</a>"
     )
   body = f"""<main class="start"><div class="start-main"><div class="mark" aria-hidden="true">∞</div>
-<h1>Recovery needs a fresh launch.</h1><p class="lede">This on-demand worker restarted while the page was inactive, so its in-memory session was safely erased. Return to Mobius and open Recovery again to create a new one-time capability.</p>{action}</div></main>"""
-  return _document("Fresh launch required · Mobius Recovery", body, nonce)
+<h1>Recovery needs a fresh launch.</h1><p class="lede">This on-demand worker restarted while the page was inactive, so its in-memory session was safely erased. Return to Möbius and open Recovery again to create a new one-time capability.</p>{action}</div></main>"""
+  return _document("Fresh launch required · Möbius Recovery", body, nonce)
 
 
 def closed_page(
@@ -141,11 +141,11 @@ def closed_page(
   if return_url:
     action = (
       f'<a class="button" href="{html.escape(return_url, quote=True)}">'
-      "Return to Mobius</a>"
+      "Return to Möbius</a>"
     )
   body = f"""<main class="start"><div class="start-main"><div class="mark" aria-hidden="true">∞</div>
 <h1>{html.escape(title)}</h1><p class="lede">{html.escape(detail)}</p>{action}</div></main>"""
-  return _document("Recovery closed · Mobius", body, nonce)
+  return _document("Recovery closed · Möbius", body, nonce)
 
 
 def recovery_page(
@@ -164,7 +164,7 @@ def recovery_page(
     if finishing else readiness_error or "Connected to one repair target"
   )
   body = f"""<main class="shell"><aside class="rail"><div class="brand"><div class="mark" aria-hidden="true">∞</div>
-<span>Mobius Recovery</span></div><div class="status-line"><span id="target-dot" class="{dot_class}"></span><span><strong>Isolated worker</strong><br>
+<span>Möbius Recovery</span></div><div class="status-line"><span id="target-dot" class="{dot_class}"></span><span><strong>Isolated worker</strong><br>
 <span id="target-status">{html.escape(target_text)}</span></span></div><div class="facts">"""
   for label, value in facts.items():
     body += f'<div class="fact"><span class="fact-label">{html.escape(label.title())}</span><span class="mono">{html.escape(value)}</span></div>'
@@ -192,7 +192,7 @@ def recovery_page(
     "const initialFinishing=false;",
     f"const initialFinishing={'true' if finishing else 'false'};",
   )
-  return _document("Repair · Mobius Recovery", body, nonce, script)
+  return _document("Repair · Möbius Recovery", body, nonce, script)
 
 
 _SCRIPT = r"""

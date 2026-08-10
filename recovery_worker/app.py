@@ -1,4 +1,4 @@
-"""HTTP entrypoint for the ephemeral Mobius recovery worker."""
+"""HTTP entrypoint for the ephemeral Möbius recovery worker."""
 
 from __future__ import annotations
 
@@ -304,7 +304,7 @@ def create_app(
     await asyncio.to_thread(control.close)
 
   app = FastAPI(
-    title="Mobius Recovery Worker", docs_url=None, redoc_url=None,
+    title="Möbius Recovery Worker", docs_url=None, redoc_url=None,
     openapi_url=None, lifespan=lifespan,
   )
   app.state.settings = settings
