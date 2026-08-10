@@ -1,8 +1,8 @@
-# Mobius Recovery Interface
+# Möbius Recovery interface
 
 ## Visual world
 
-Recovery inherits Mobius's quiet operational shell: near-black neutral surfaces,
+Recovery inherits Möbius's quiet operational shell: near-black neutral surfaces,
 off-white text, a single violet action color, and compact status language. It is
 an incident workspace, not a warning-themed emergency console; red is reserved
 for actual errors and destructive cancellation.
