@@ -75,5 +75,8 @@ scripts/verify-image.sh mobius-recovery:dev development
 
 `GET /health` reports the baked image revision and protocol version. CI tests
 the code, builds once, verifies that exact image, publishes an immutable commit
-tag, and advances `stable` from `main`. No fleet reconciliation is needed
+tag, verifies the registry digest, and promotes `stable` only when that commit
+is still the current `main` head. The launcher resolves and verifies that
+channel to `stable@sha256:...` whenever Recovery opens, so releases need no
+manual cross-repository digest handoff. No fleet reconciliation is needed
 because workers do not exist between sessions.

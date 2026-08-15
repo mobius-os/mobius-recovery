@@ -43,7 +43,14 @@ def test_release_workflow_publishes_only_verified_image() -> None:
   workflow = (ROOT / ".github/workflows/release.yml").read_text(encoding="utf-8")
   assert "cancel-in-progress: false" in workflow
   verify = workflow.index("- name: Verify immutable and non-root boundary")
-  publish = workflow.index("- name: Publish immutable image and stable main")
+  publish = workflow.index("- name: Publish and verify immutable image")
+  promote = workflow.index("- name: Promote current main head to stable and verify it")
   assert verify < publish
+  assert publish < promote
+  assert "docker buildx imagetools create --prefer-index=false" in workflow
+  assert '--tag "$STABLE_IMAGE" "$SHA_IMAGE"' in workflow
+  assert "gh api \"repos/$GITHUB_REPOSITORY/commits/main\"" in workflow
+  assert workflow.count("--format '{{json .Manifest}}'") == 2
+  assert "mobius-recovery-stable-promotion" in workflow
   assert "mobius.you" not in workflow
   assert "reconcile" not in workflow
