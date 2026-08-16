@@ -9,6 +9,9 @@ on:
 permissions:
   contents: read
 
+env:
+  RECOVERY_IMAGE_REPOSITORY: ghcr.io/mobius-os/mobius-recovery
+
 concurrency:
   group: recovery-release-${{ github.ref }}
   cancel-in-progress: false
@@ -20,8 +23,13 @@ jobs:
     permissions:
       contents: read
       packages: write
+    outputs:
+      digest: ${{ steps.publish.outputs.digest }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v3.11.1
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: '3.12'
@@ -46,14 +54,86 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-      - name: Publish immutable image and stable main
+      - name: Publish and verify immutable image
+        id: publish
         if: github.event_name != 'pull_request'
         run: |
-          image="ghcr.io/mobius-os/mobius-recovery"
+          set -euo pipefail
+
+          image="$RECOVERY_IMAGE_REPOSITORY"
           immutable="sha-$GITHUB_SHA"
           docker tag mobius-recovery:verified "$image:$immutable"
           docker push "$image:$immutable"
-          if [ "$GITHUB_REF" = refs/heads/main ]; then
-            docker tag mobius-recovery:verified "$image:stable"
-            docker push "$image:stable"
+
+          resolve_digest() {
+            local image_ref="$1"
+            local manifest=""
+            for _ in $(seq 1 12); do
+              if manifest="$(
+                docker buildx imagetools inspect "$image_ref" \
+                  --format '{{json .Manifest}}' 2>/dev/null
+              )" && [ -n "$manifest" ]; then
+                jq -er '.digest' <<<"$manifest"
+                return
+              fi
+              sleep 5
+            done
+            echo "GHCR did not resolve $image_ref after publication." >&2
+            return 1
+          }
+
+          digest="$(resolve_digest "$image:$immutable")"
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
+
+  promote-stable:
+    needs: test-and-publish
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    concurrency:
+      group: mobius-recovery-stable-promotion
+      cancel-in-progress: false
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v3.11.1
+      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Promote current main head to stable and verify it
+        env:
+          EXPECTED_DIGEST: ${{ needs['test-and-publish'].outputs.digest }}
+          GH_TOKEN: ${{ github.token }}
+          SHA_IMAGE: ${{ env.RECOVERY_IMAGE_REPOSITORY }}:sha-${{ github.sha }}
+          STABLE_IMAGE: ${{ env.RECOVERY_IMAGE_REPOSITORY }}:stable
+        run: |
+          set -euo pipefail
+
+          current_sha="$(
+            gh api "repos/$GITHUB_REPOSITORY/commits/main" --jq '.sha'
+          )"
+          if [ "$current_sha" != "$GITHUB_SHA" ]; then
+            echo "Skipping stable promotion: $GITHUB_SHA is no longer branch head $current_sha."
+            exit 0
           fi
+
+          docker buildx imagetools create --prefer-index=false \
+            --tag "$STABLE_IMAGE" "$SHA_IMAGE"
+
+          stable_digest=""
+          for _ in $(seq 1 12); do
+            if manifest="$(
+              docker buildx imagetools inspect "$STABLE_IMAGE" \
+                --format '{{json .Manifest}}' 2>/dev/null
+            )" && stable_digest="$(jq -er '.digest' <<<"$manifest")"; then
+              if [ "$stable_digest" = "$EXPECTED_DIGEST" ]; then
+                exit 0
+              fi
+            fi
+            sleep 5
+          done
+          echo "Moving stable tag resolved to ${stable_digest:-nothing}, expected $EXPECTED_DIGEST." >&2
+          exit 1
