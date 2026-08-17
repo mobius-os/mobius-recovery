@@ -1,0 +1,17 @@
+version: 2
+updates:
+  - package-ecosystem: npm
+    directory: /
+    schedule: { interval: weekly }
+    open-pull-requests-limit: 3
+    versioning-strategy: increase-if-necessary
+    groups:
+      provider-clis:
+        patterns:
+          - "@anthropic-ai/claude-code"
+          - "@openai/codex"
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule: { interval: weekly }
+    open-pull-requests-limit: 3

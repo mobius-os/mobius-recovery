@@ -713,6 +713,7 @@ $('#composer').addEventListener('submit', async event => {
         } else if (payload.type === 'error') {
           stopAgentActivity();
           addMessage('assistant', payload.message, true);
+          if (payload.code === 'provider_auth_required') refreshProviders();
           reportedError = true;
         }
       }

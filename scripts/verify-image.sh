@@ -32,8 +32,8 @@ docker run --rm --entrypoint /bin/sh "$image" -c '
   ! command -v railway
   ! command -v node
   test ! -e /usr/local/lib/node_modules
-  claude --version | grep -F "2.1.218"
-  codex --version | grep -F "0.145.0"
+  claude --version | grep -F "2.1.223"
+  codex --version | grep -F "0.146.1"
   codex exec --help >/dev/null
   codex login --help >/dev/null
 '
