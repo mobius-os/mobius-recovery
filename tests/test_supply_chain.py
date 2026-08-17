@@ -36,7 +36,7 @@ def test_container_and_ci_references_are_immutable_and_integrity_locked() -> Non
 
   dev_lock = (ROOT / "requirements-dev.lock").read_text(encoding="utf-8")
   assert "-r requirements.lock" in dev_lock
-  assert dev_lock.count("--hash=sha256:") == 5
+  assert dev_lock.count("--hash=sha256:") == 11
 
 
 def test_release_workflow_publishes_only_verified_image() -> None:

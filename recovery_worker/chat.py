@@ -28,9 +28,48 @@ MAX_MESSAGE_CHARS = 32_000
 MAX_TURN_SECONDS = 900
 MAX_CLI_OUTPUT_BYTES = 16 * 1024 * 1024
 
-_run_guard = threading.Lock()
-_running = False
-_finishing = False
+
+class TurnCoordinator:
+  """Owns the one-turn/one-close gate for a worker application instance."""
+
+  def __init__(self) -> None:
+    self._lock = threading.Lock()
+    self._running = False
+    self._finishing = False
+
+  def claim_turn(self) -> bool:
+    with self._lock:
+      if self._running or self._finishing:
+        return False
+      self._running = True
+      return True
+
+  def release_turn(self) -> None:
+    with self._lock:
+      self._running = False
+
+  def begin_finish(self) -> bool:
+    """Prevent new turns before the active provider process is stopped."""
+    with self._lock:
+      if self._finishing:
+        return False
+      self._finishing = True
+      return True
+
+  def reset(self) -> None:
+    with self._lock:
+      self._running = False
+      self._finishing = False
+
+  @property
+  def turn_active(self) -> bool:
+    with self._lock:
+      return self._running
+
+  @property
+  def finishing(self) -> bool:
+    with self._lock:
+      return self._finishing
 
 
 SYSTEM_PROMPT = """You are the Möbius recovery agent. The owner opened this
@@ -71,47 +110,6 @@ def _history(session: RecoverySession) -> str:
     + "\n".join(lines)
     + "\n\nRespond to the final USER message."
   )
-
-
-def _claim() -> bool:
-  global _running
-  with _run_guard:
-    if _running or _finishing:
-      return False
-    _running = True
-    return True
-
-
-def _release() -> None:
-  global _running
-  with _run_guard:
-    _running = False
-
-
-def claim_finish() -> bool:
-  """Atomically prevents new turns while allowing the active turn to stop."""
-  global _finishing
-  with _run_guard:
-    if _finishing:
-      return False
-    _finishing = True
-    return True
-
-
-def release_finish() -> None:
-  global _finishing
-  with _run_guard:
-    _finishing = False
-
-
-def turn_active() -> bool:
-  with _run_guard:
-    return _running
-
-
-def finish_active() -> bool:
-  with _run_guard:
-    return _finishing
 
 
 def _kill_group(proc: asyncio.subprocess.Process, sig: int) -> None:
@@ -322,6 +320,7 @@ async def stream_turn(
   session: RecoverySession,
   provider_auth: ProviderAuth,
   workspaces: SessionWorkspaces,
+  turns: TurnCoordinator,
 ) -> AsyncIterator[dict]:
   if provider not in {"claude", "codex"}:
     yield {"type": "error", "message": "Unsupported provider."}
@@ -331,14 +330,14 @@ async def stream_turn(
     yield {"type": "error", "message": "Message must be 1–32,000 characters."}
     yield {"type": "done"}
     return
-  if not _claim():
+  if not turns.claim_turn():
     yield {"type": "error", "message": "Another recovery turn is running."}
     yield {"type": "done"}
     return
   if session.revoked or session.finishing:
     yield {"type": "error", "message": "Recovery session expired."}
     yield {"type": "done"}
-    _release()
+    turns.release_turn()
     return
   session.add_message("user", message.strip())
   try:
@@ -354,5 +353,5 @@ async def stream_turn(
     # A CLI can spawn a helper into a fresh process group and then exit. Do not
     # leave that helper with access to the still-live session broker.
     await asyncio.to_thread(terminate_descendants)
-    _release()
+    turns.release_turn()
   yield {"type": "done"}

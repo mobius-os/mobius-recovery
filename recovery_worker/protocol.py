@@ -1,4 +1,4 @@
-"""Small shared validation primitives for recovery protocol v2."""
+"""Small shared validation primitives for recovery protocol v3."""
 
 from __future__ import annotations
 

@@ -75,14 +75,15 @@ label { display: block; margin-bottom: 8px; font-size: .84rem; font-weight: 650;
   background: var(--raised); color: var(--text); caret-color: var(--accent);
 }
 .button {
-  min-height: 44px; padding: 11px 15px; border: 0; border-radius: 12px;
+  display: inline-flex; min-height: 44px; align-items: center; justify-content: center;
+  padding: 11px 15px; border: 0; border-radius: 12px;
   background: var(--accent); color: #100d18; font-weight: 720;
 }
-.button:hover { background: var(--accent-hover); }
+.button:not(:disabled):hover { background: var(--accent-hover); }
 .button:disabled { cursor: not-allowed; opacity: .5; }
 .button.secondary { border: 1px solid var(--border); background: var(--raised); color: var(--text); }
-.button.secondary:hover { background: var(--raised-hover); }
-.button.compact { min-height: 34px; padding: 6px 10px; font-size: .78rem; }
+.button.secondary:not(:disabled):hover { background: var(--raised-hover); }
+.button.compact { padding: 8px 11px; font-size: .78rem; }
 .error { padding: 12px 14px; border: 1px solid rgba(251,113,133,.35); border-radius: 12px; background: rgba(251,113,133,.12); color: #ffd7de; line-height: 1.5; }
 .stack { display: grid; gap: 12px; }
 .shell { display: grid; min-height: 100vh; grid-template-columns: 296px minmax(0, 1fr); }
@@ -104,12 +105,12 @@ label { display: block; margin-bottom: 8px; font-size: .84rem; font-weight: 650;
 .session-life.warning .countdown { color: var(--warning); }
 .providers { display: grid; gap: 5px; }
 .provider { display: flex; min-width: 0; align-items: center; justify-content: space-between; gap: 10px; padding: 8px 0; }
-.provider-name { display: flex; align-items: center; gap: 9px; margin: 0; }
+.provider-name { display: flex; min-height: 44px; align-items: center; gap: 9px; margin: 0; }
 .provider input { accent-color: var(--accent); }
-.link-button { padding: 6px; border: 0; background: none; color: var(--focus); font-size: .8rem; }
+.link-button { min-height: 44px; padding: 8px; border: 0; background: none; color: var(--focus); font-size: .8rem; }
 .link-button:disabled { color: var(--faint); cursor: default; }
 .session-details { color: var(--muted); font-size: .78rem; }
-.session-details summary { cursor: pointer; color: var(--faint); }
+.session-details summary { display: flex; min-height: 44px; align-items: center; cursor: pointer; color: var(--faint); }
 .facts { display: grid; gap: 10px; padding-top: 12px; }
 .fact span { display: block; }
 .fact-label { margin-bottom: 2px; color: var(--faint); font-size: .7rem; }
@@ -158,6 +159,10 @@ dialog::backdrop { background: rgba(5,5,6,.84); }
   *, *::before, *::after { animation-duration: 1ms !important; animation-iteration-count: 1 !important; scroll-behavior: auto !important; }
   .spinner { border-color: var(--accent); opacity: .65; }
   .agent-activity strong::after { display: none; }
+}
+@media (forced-colors: active) {
+  .dot, .spinner { forced-color-adjust: none; }
+  .button, .input, .composer, dialog { border: 1px solid ButtonText; }
 }
 @media (max-width: 760px) {
   .shell { display: block; }
@@ -220,21 +225,13 @@ def lost_page(nonce: str, *, return_url: str | None) -> str:
 def closed_page(
   nonce: str,
   *,
-  outcome: str,
   return_url: str | None,
 ) -> str:
-  if outcome == "recovered":
-    title = "Recovery finished."
-    detail = (
-      "The temporary capability is closed. Möbius kept running in place while "
-      "you worked, and mobius.you is removing this recovery worker."
-    )
-  else:
-    title = "Recovery session cancelled."
-    detail = (
-      "The temporary capability is closed. Return to mobius.you when you are "
-      "ready to start another recovery."
-    )
+  title = "Recovery finished."
+  detail = (
+    "The temporary capability is closed. Möbius kept running in place while "
+    "you worked, and mobius.you is removing this recovery worker."
+  )
   action = ""
   if return_url:
     action = (
@@ -285,7 +282,7 @@ def recovery_page(
 <button class="button secondary" id="finish" type="button">End recovery</button></div></aside>
 <section class="workspace"><header class="workspace-head"><div><strong>Repair conversation</strong>
 <p id="provider-state">Checking provider connection…</p></div><span class="remote-badge">Bound target only</span><button class="link-button mobile-end" id="finish-mobile" type="button">End recovery</button></header>
-<div class="messages" id="messages" aria-live="polite"><div class="empty" id="empty"><h1>What needs fixing?</h1>
+<div class="messages" id="messages"><div class="empty" id="empty"><h1>What needs fixing?</h1>
 <p class="lede">Describe what failed, what changed just before it, and what still works. The agent can inspect and repair only this Möbius container.</p>
 <div class="empty-note"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true"><path d="M12 3 4.5 6v5.5c0 4.5 3.1 7.6 7.5 9.5 4.4-1.9 7.5-5 7.5-9.5V6L12 3Z"/><path d="m9 12 2 2 4-4"/></svg><span>Möbius keeps running while you work. Commands use temporary root access through the fixed recovery relay.</span></div></div></div>
 <div class="composer-wrap"><form class="composer" id="composer"><label class="sr" for="message">Message recovery agent</label>
@@ -421,7 +418,6 @@ function startAgentActivity(provider, label = 'Recovery agent is starting') {
   activityElement = document.createElement('div');
   activityElement.className = 'agent-activity';
   activityElement.role = 'status';
-  activityElement.setAttribute('aria-live', 'polite');
   const spinner = document.createElement('span');
   spinner.className = 'spinner';
   spinner.setAttribute('aria-hidden', 'true');
@@ -430,6 +426,7 @@ function startAgentActivity(provider, label = 'Recovery agent is starting') {
   headline.textContent = label;
   headline.dataset.label = label;
   const detail = document.createElement('small');
+  detail.setAttribute('aria-hidden', 'true');
   const providerName = provider === 'codex' ? 'Codex' : 'Claude';
   detail.textContent = `${providerName} is connecting · 0:00 elapsed · first response can take about a minute`;
   body.append(headline, detail);
@@ -744,10 +741,6 @@ function handleFinish(data) {
     location.replace('/');
     return;
   }
-  if (data.status === 'resumed') {
-    location.reload();
-    return;
-  }
   if (data.status === 'failed') {
     enterFinishing(data.error?.message || 'Recovery could not be ended.');
     return;
@@ -770,7 +763,7 @@ async function pollFinish() {
 async function finish() {
   enterFinishing();
   try {
-    handleFinish(await api('/api/finish', { method: 'POST', body: JSON.stringify({ outcome: 'recovered' }) }));
+    handleFinish(await api('/api/finish', { method: 'POST', body: '{}' }));
   } catch (error) {
     if (redirectLost(error)) return;
     if (error.status && error.status < 500) {
