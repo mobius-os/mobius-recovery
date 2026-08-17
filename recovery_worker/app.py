@@ -364,6 +364,9 @@ def create_app(
         build_sha=settings.build_sha, session_id=session.session_id,
         readiness_error=session.readiness_error,
         finishing=session.finishing,
+        idle_expires_at=session.exchange.idle_expires_at,
+        expires_at=session.expires_at,
+        idle_timeout_seconds=session.exchange.idle_timeout_seconds,
       )
     return _security_headers(HTMLResponse(body), nonce)
 
@@ -401,6 +404,9 @@ def create_app(
       nonce, protocol_version=WORKER_PROTOCOL_VERSION,
       build_sha=settings.build_sha, session_id=session.session_id,
       readiness_error=session.readiness_error,
+      idle_expires_at=session.exchange.idle_expires_at,
+      expires_at=session.expires_at,
+      idle_timeout_seconds=session.exchange.idle_timeout_seconds,
     )
     response = HTMLResponse(body)
     response.set_cookie(
@@ -415,6 +421,21 @@ def create_app(
     await interactive(request)
     return _security_headers(JSONResponse(await asyncio.to_thread(providers.status)))
 
+  async def touch_session(session: RecoverySession) -> dict:
+    await asyncio.to_thread(control.activity, session.exchange)
+    return {
+      "status": "active",
+      "idle_expires_at": session.exchange.idle_expires_at.isoformat(),
+      "expires_at": session.expires_at.isoformat(),
+      "idle_timeout_seconds": session.exchange.idle_timeout_seconds,
+    }
+
+  @app.post("/api/session/activity")
+  async def session_activity(request: Request):
+    _same_origin(request)
+    _, session = await interactive(request)
+    return _security_headers(JSONResponse(await touch_session(session)))
+
   @app.get("/api/target/health")
   async def target_health(request: Request):
     _, session = await current(request)
@@ -426,18 +447,25 @@ def create_app(
       )
     result = await asyncio.to_thread(_target_ready, control, session)
     session.readiness_error = None
-    return _security_headers(JSONResponse({"status": "ready", "target": result}))
+    return _security_headers(JSONResponse({
+      "status": "ready",
+      "target": result,
+      "idle_expires_at": session.exchange.idle_expires_at.isoformat(),
+      "expires_at": session.expires_at.isoformat(),
+    }))
 
   @app.post("/api/providers/claude/start")
   async def claude_start(request: Request):
     _same_origin(request)
-    await interactive(request)
+    _, session = await interactive(request)
+    await touch_session(session)
     return _security_headers(JSONResponse(await asyncio.to_thread(providers.claude_start)))
 
   @app.post("/api/providers/claude/exchange")
   async def claude_exchange(request: Request):
     _same_origin(request)
-    await interactive(request)
+    _, session = await interactive(request)
+    await touch_session(session)
     payload = await _json_body(request)
     await asyncio.to_thread(providers.claude_exchange, str(payload.get("code") or ""))
     return _security_headers(JSONResponse({"status": "connected"}))
@@ -445,7 +473,8 @@ def create_app(
   @app.post("/api/providers/codex/start")
   async def codex_start(request: Request):
     _same_origin(request)
-    await interactive(request)
+    _, session = await interactive(request)
+    await touch_session(session)
     return _security_headers(JSONResponse(await asyncio.to_thread(providers.codex_start)))
 
   @app.get("/api/providers/codex/status")
@@ -468,12 +497,16 @@ def create_app(
     _, session = await current(request)
     return _security_headers(JSONResponse({
       "active": turn_active(), "finishing": session.finishing,
+      "idle_expires_at": session.exchange.idle_expires_at.isoformat(),
+      "expires_at": session.expires_at.isoformat(),
+      "idle_timeout_seconds": session.exchange.idle_timeout_seconds,
     }))
 
   @app.post("/api/chat/stream")
   async def chat_stream(request: Request):
     _same_origin(request)
     _, session = await interactive(request)
+    await touch_session(session)
     payload = await _json_body(request)
     message, provider = payload.get("message"), payload.get("provider")
     if not isinstance(message, str) or not isinstance(provider, str):
@@ -511,7 +544,7 @@ def create_app(
     if outcome not in {"recovered", "cancelled"}:
       raise ProtocolError("invalid_outcome", "Outcome is invalid.", 400)
     if not session.finishing and not claim_finish():
-      raise ProtocolError("turn_active", "Wait for the active recovery turn to finish.", 409)
+      raise ProtocolError("finish_in_progress", "Recovery is already closing.", 409)
     progress = await asyncio.to_thread(sessions.begin_finish, token, outcome)
     return finish_response(progress)
 

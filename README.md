@@ -41,8 +41,11 @@ Railway's SSH host key.
    instance without restarting or changing that service.
 3. The browser exchanges its one-time handoff with the worker. The worker keeps
    its short-lived command capability in memory and starts the local socket.
-4. Finishing or expiry stops provider processes, removes temporary files,
-   revokes the session, and asks mobius.you to delete the temporary service.
+4. Owner or agent activity renews a durable 20-minute idle deadline without
+   extending the one-hour absolute limit.
+5. Ending, inactivity, or absolute expiry stops provider processes, removes
+   temporary files, revokes the session, and asks mobius.you to delete the
+   temporary service.
 
 There is no recovery boot mode, target protocol, crash-loop counter, recovery
 volume mutation, or resume generation. If a worker disappears, open Recovery

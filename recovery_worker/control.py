@@ -22,9 +22,19 @@ class ExchangeResult:
   session_id: str
   session_capability: str
   expires_at: datetime
+  idle_expires_at: datetime
+  idle_timeout_seconds: int
 
   def clear(self) -> None:
     self.session_capability = ""
+
+  def update_deadlines(self, data: dict) -> None:
+    absolute = parse_expiry(data.get("expires_at"))
+    idle = parse_expiry(data.get("idle_expires_at"))
+    if idle > absolute:
+      raise ProtocolError("invalid_control_response", "session deadline is invalid", 502)
+    self.expires_at = absolute
+    self.idle_expires_at = idle
 
 
 class ControlClient:
@@ -138,11 +148,23 @@ class ControlClient:
       raise ProtocolError("invalid_exchange", "session capability is missing", 502)
     if launcher_url != self._settings.control_plane_url:
       raise ProtocolError("invalid_exchange", "launcher origin changed", 502)
-    return ExchangeResult(
+    idle_timeout = data.get("idle_timeout_seconds")
+    if (
+      isinstance(idle_timeout, bool)
+      or not isinstance(idle_timeout, int)
+      or not 60 <= idle_timeout <= 3600
+    ):
+      raise ProtocolError("invalid_exchange", "idle timeout is invalid", 502)
+    exchange = ExchangeResult(
       session_id=session_id,
       session_capability=capability,
       expires_at=parse_expiry(data.get("expires_at")),
+      idle_expires_at=parse_expiry(data.get("idle_expires_at")),
+      idle_timeout_seconds=idle_timeout,
     )
+    if exchange.idle_expires_at > exchange.expires_at:
+      raise ProtocolError("invalid_exchange", "session deadline is invalid", 502)
+    return exchange
 
   def acknowledge(self, exchange: ExchangeResult) -> None:
     status, data = self._request_json(
@@ -154,6 +176,25 @@ class ControlClient:
     )
     if status >= 300:
       self._raise_remote(status, data, "Could not acknowledge recovery launch.")
+    exchange.update_deadlines(data)
+
+  def activity(self, exchange: ExchangeResult) -> dict:
+    status, data = self._request_json(
+      "POST",
+      "/recovery/activity",
+      {"session_id": exchange.session_id},
+      capability=exchange.session_capability,
+      retry_transport_once=True,
+    )
+    if status >= 300:
+      self._raise_remote(status, data, "Recovery session expired.")
+    if data.get("status") != "active" or data.get("session_id") != exchange.session_id:
+      raise ProtocolError("invalid_control_response", "activity result is malformed", 502)
+    exchange.update_deadlines(data)
+    return {
+      "idle_expires_at": exchange.idle_expires_at,
+      "expires_at": exchange.expires_at,
+    }
 
   def exec(self, exchange: ExchangeResult, args: dict) -> dict:
     status, data = self._request_json(
@@ -167,6 +208,7 @@ class ControlClient:
     required = {"stdout_base64", "stderr_base64", "exit_code"}
     if not required.issubset(data):
       raise ProtocolError("invalid_control_response", "command result is malformed", 502)
+    exchange.update_deadlines(data)
     return {key: data[key] for key in required}
 
   def finish(self, exchange: ExchangeResult, outcome: str) -> dict:
