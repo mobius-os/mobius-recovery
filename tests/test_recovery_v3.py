@@ -11,14 +11,7 @@ from fastapi.testclient import TestClient
 
 import recovery_worker.app as app_module
 from recovery_worker.broker import CommandBroker, broker_request
-from recovery_worker.chat import (
-  _claim,
-  _release,
-  claim_finish,
-  finish_active,
-  release_finish,
-  turn_active,
-)
+from recovery_worker.chat import TurnCoordinator
 from recovery_worker.app import create_app
 from recovery_worker.config import Settings, WORKER_PROTOCOL_VERSION
 from recovery_worker.control import ControlClient, ExchangeResult
@@ -88,6 +81,7 @@ def test_exchange_returns_only_launcher_capability_and_pins_origin() -> None:
   result = client.exchange("one-time", "mob_instance-1")
   body = json.loads(requests[0].content)
   assert requests[0].url.path == "/recovery/exchange"
+  assert requests[0].headers["user-agent"] == WORKER_PROTOCOL_VERSION
   assert body["protocol_version"] == WORKER_PROTOCOL_VERSION
   assert "target_url" not in body and "target_token" not in body
   assert result.session_capability == CAPABILITY
@@ -150,9 +144,9 @@ def test_session_code_is_single_use_and_finish_closes_before_control() -> None:
     def acknowledge(self, exchange):
       events.append(("ack", exchange.session_id))
 
-    def finish(self, exchange, outcome):
-      events.append(("finish", exchange.session_id, outcome))
-      return {"status": "finished", "outcome": outcome}
+    def finish(self, exchange):
+      events.append(("finish", exchange.session_id))
+      return {"status": "finished"}
 
   store = SessionStore(
     control=FakeControl(),
@@ -160,11 +154,11 @@ def test_session_code_is_single_use_and_finish_closes_before_control() -> None:
     on_finish_accepted=lambda session: events.append(("quiesce", session.session_id)),
   )
   token, _session = store.start("one-time", "mob_instance-1")
-  result = store.begin_finish(token, "recovered")
+  result = store.begin_finish(token)
   assert result["status"] == "finished"
   assert events[-2:] == [
     ("quiesce", "rec_session"),
-    ("finish", "rec_session", "recovered"),
+    ("finish", "rec_session"),
   ]
   assert store.get(token) is None
   with pytest.raises(ProtocolError):
@@ -172,15 +166,18 @@ def test_session_code_is_single_use_and_finish_closes_before_control() -> None:
 
 
 def test_finish_can_claim_and_stop_an_active_turn() -> None:
-  assert _claim() is True
-  try:
-    assert turn_active() is True
-    assert claim_finish() is True
-    assert finish_active() is True
-    assert claim_finish() is False
-  finally:
-    release_finish()
-    _release()
+  turns = TurnCoordinator()
+  other_app_turns = TurnCoordinator()
+  assert turns.claim_turn() is True
+  assert turns.turn_active is True
+  assert other_app_turns.claim_turn() is True
+  other_app_turns.release_turn()
+  assert turns.begin_finish() is True
+  assert turns.finishing is True
+  assert turns.begin_finish() is False
+  turns.reset()
+  assert turns.turn_active is False
+  assert turns.finishing is False
 
 
 def test_exec_relay_uses_capability_and_has_no_target_selector() -> None:
@@ -265,8 +262,9 @@ def test_failed_post_exchange_probe_keeps_a_closable_browser_session(
         "error": {"message": "Railway SSH is temporarily unavailable"},
       })
     if request.url.path == "/recovery/finish":
+      assert json.loads(request.content) == {"session_id": "rec_session"}
       return httpx.Response(200, json={
-        "status": "finished", "outcome": "cancelled",
+        "session_id": "rec_session", "status": "finished",
       })
     raise AssertionError(request.url.path)
 
@@ -291,7 +289,7 @@ def test_failed_post_exchange_probe_keeps_a_closable_browser_session(
     assert blocked.status_code == 503
     assert blocked.json()["error"]["code"] == "target_unavailable"
 
-    finished = client.post(
+    legacy_finish = client.post(
       "/api/finish",
       json={"outcome": "cancelled"},
       headers={
@@ -299,8 +297,19 @@ def test_failed_post_exchange_probe_keeps_a_closable_browser_session(
         "Sec-Fetch-Site": "same-origin",
       },
     )
+    assert legacy_finish.status_code == 400
+    assert legacy_finish.json()["error"]["code"] == "invalid_request"
+
+    finished = client.post(
+      "/api/finish",
+      json={},
+      headers={
+        "Origin": "https://worker.example",
+        "Sec-Fetch-Site": "same-origin",
+      },
+    )
     assert finished.status_code == 200
-    assert finished.json() == {"status": "finished", "outcome": "cancelled"}
+    assert finished.json() == {"status": "finished"}
 
   assert paths[-1] == "/recovery/finish"
 

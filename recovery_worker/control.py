@@ -53,7 +53,7 @@ class ControlClient:
       follow_redirects=False,
       trust_env=False,
       transport=transport,
-      headers={"User-Agent": "mobius-recovery-worker/2"},
+      headers={"User-Agent": WORKER_PROTOCOL_VERSION},
     )
 
   def close(self) -> None:
@@ -211,18 +211,19 @@ class ControlClient:
     exchange.update_deadlines(data)
     return {key: data[key] for key in required}
 
-  def finish(self, exchange: ExchangeResult, outcome: str) -> dict:
-    if outcome not in {"recovered", "cancelled"}:
-      raise ProtocolError("invalid_outcome", "invalid recovery outcome", 400)
+  def finish(self, exchange: ExchangeResult) -> dict:
     status, data = self._request_json(
       "POST",
       "/recovery/finish",
-      {"session_id": exchange.session_id, "outcome": outcome},
+      {"session_id": exchange.session_id},
       capability=exchange.session_capability,
       retry_transport_once=True,
     )
     if status >= 300:
       self._raise_remote(status, data, "Could not close the recovery session.")
-    if data.get("status") != "finished" or data.get("outcome") != outcome:
+    if (
+      data.get("status") != "finished"
+      or data.get("session_id") != exchange.session_id
+    ):
       raise ProtocolError("invalid_control_response", "finish result is malformed", 502)
-    return {"status": "finished", "outcome": outcome}
+    return {"status": "finished"}

@@ -18,13 +18,7 @@ from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 
 from .broker import BROKER_SOCKET, CommandBroker
-from .chat import (
-  claim_finish,
-  finish_active,
-  release_finish,
-  stream_turn,
-  turn_active,
-)
+from .chat import TurnCoordinator, stream_turn
 from .config import WORKER_PROTOCOL_VERSION, Settings
 from .control import ControlClient
 from .pages import closed_page, launch_page, lost_page, recovery_page
@@ -51,12 +45,14 @@ class RecoveryRuntime:
     control: ControlClient,
     providers: ProviderAuth,
     workspaces: SessionWorkspaces,
+    turns: TurnCoordinator,
     *,
     broker_path: Path,
   ) -> None:
     self._control = control
     self._providers = providers
     self._workspaces = workspaces
+    self._turns = turns
     self._broker_path = broker_path
     self._active: tuple[str, CommandBroker] | None = None
     self._sessions: SessionStore | None = None
@@ -66,7 +62,10 @@ class RecoveryRuntime:
     self._sessions = sessions
 
   def activate(self, session: RecoverySession) -> None:
-    if session.revoked or session.expires_at <= datetime.now(timezone.utc):
+    if (
+      session.revoked
+      or session.exchange.expires_at <= datetime.now(timezone.utc)
+    ):
       raise ProtocolError("auth_expired", "Recovery session expired.", 401)
     with self._lock:
       if self._active:
@@ -86,7 +85,7 @@ class RecoveryRuntime:
         )
         broker.start()
         self._active = (session.session_id, broker)
-        release_finish()
+        self._turns.reset()
       except Exception:
         if broker:
           broker.stop()
@@ -110,7 +109,7 @@ class RecoveryRuntime:
       finally:
         self._providers.clear()
         self._workspaces.clear()
-        release_finish()
+        self._turns.reset()
 
   def quiesce(self, session: RecoverySession) -> None:
     self.revoke(session, "finishing")
@@ -126,7 +125,7 @@ class RecoveryRuntime:
         self._active = None
       self._providers.clear()
       self._workspaces.clear()
-      release_finish()
+      self._turns.reset()
 
 
 def _nonce() -> str:
@@ -134,7 +133,9 @@ def _nonce() -> str:
 
 
 def _cookie_max_age(session: RecoverySession) -> int:
-  remaining = int((session.expires_at - datetime.now(timezone.utc)).total_seconds())
+  remaining = int(
+    (session.exchange.expires_at - datetime.now(timezone.utc)).total_seconds()
+  )
   return max(1, min(MAX_BROWSER_SESSION_SECONDS, remaining))
 
 
@@ -278,6 +279,7 @@ def create_app(
   settings.validate()
   control = ControlClient(settings, transport=control_transport)
   providers = ProviderAuth()
+  turns = TurnCoordinator()
   resolved_broker_path = broker_path or BROKER_SOCKET
   resolved_workspace_root = (
     Path(workspace_root) if workspace_root is not None
@@ -285,7 +287,7 @@ def create_app(
   )
   workspaces = SessionWorkspaces(resolved_workspace_root)
   runtime = RecoveryRuntime(
-    control, providers, workspaces, broker_path=resolved_broker_path
+    control, providers, workspaces, turns, broker_path=resolved_broker_path
   )
   sessions = SessionStore(
     control=control,
@@ -311,6 +313,7 @@ def create_app(
   app.state.sessions = sessions
   app.state.providers = providers
   app.state.runtime = runtime
+  app.state.turns = turns
   app.state.workspaces = workspaces
 
   @app.exception_handler(ProtocolError)
@@ -329,7 +332,7 @@ def create_app(
 
   async def interactive(request: Request) -> tuple[str, RecoverySession]:
     token, session = await current(request)
-    if session.finishing or finish_active():
+    if session.finishing or turns.finishing:
       raise ProtocolError("finish_in_progress", "Recovery is already closing.", 409)
     if session.readiness_error:
       raise ProtocolError("target_unavailable", session.readiness_error, 503)
@@ -350,10 +353,8 @@ def create_app(
     session = await asyncio.to_thread(sessions.get, browser_token)
     if session is None:
       closed = request.cookies.get(CLOSED_COOKIE)
-      if closed in {"recovered", "cancelled"}:
-        body = closed_page(
-          nonce, outcome=closed, return_url=settings.control_plane_url
-        )
+      if closed == "1":
+        body = closed_page(nonce, return_url=settings.control_plane_url)
       elif browser_token:
         body = lost_page(nonce, return_url=settings.control_plane_url)
       else:
@@ -365,7 +366,7 @@ def create_app(
         readiness_error=session.readiness_error,
         finishing=session.finishing,
         idle_expires_at=session.exchange.idle_expires_at,
-        expires_at=session.expires_at,
+        expires_at=session.exchange.expires_at,
         idle_timeout_seconds=session.exchange.idle_timeout_seconds,
       )
     return _security_headers(HTMLResponse(body), nonce)
@@ -397,7 +398,7 @@ def create_app(
     except Exception:
       # No post-exchange setup failure may discard the only browser handle for
       # an active grant. Keep the detailed exception out of the response, but
-      # retain an authenticated page from which the owner can cancel safely.
+      # retain an authenticated page from which the owner can end it safely.
       LOGGER.exception("Recovery runtime setup failed after exchange")
       session.readiness_error = "The recovery worker could not prepare the target connection."
     body = recovery_page(
@@ -405,7 +406,7 @@ def create_app(
       build_sha=settings.build_sha, session_id=session.session_id,
       readiness_error=session.readiness_error,
       idle_expires_at=session.exchange.idle_expires_at,
-      expires_at=session.expires_at,
+      expires_at=session.exchange.expires_at,
       idle_timeout_seconds=session.exchange.idle_timeout_seconds,
     )
     response = HTMLResponse(body)
@@ -426,7 +427,7 @@ def create_app(
     return {
       "status": "active",
       "idle_expires_at": session.exchange.idle_expires_at.isoformat(),
-      "expires_at": session.expires_at.isoformat(),
+      "expires_at": session.exchange.expires_at.isoformat(),
       "idle_timeout_seconds": session.exchange.idle_timeout_seconds,
     }
 
@@ -439,7 +440,7 @@ def create_app(
   @app.get("/api/target/health")
   async def target_health(request: Request):
     _, session = await current(request)
-    if session.finishing or finish_active():
+    if session.finishing or turns.finishing:
       raise ProtocolError("finish_in_progress", "Recovery is already closing.", 409)
     if not await asyncio.to_thread(runtime.active_for, session):
       raise ProtocolError(
@@ -451,7 +452,7 @@ def create_app(
       "status": "ready",
       "target": result,
       "idle_expires_at": session.exchange.idle_expires_at.isoformat(),
-      "expires_at": session.expires_at.isoformat(),
+      "expires_at": session.exchange.expires_at.isoformat(),
     }))
 
   @app.post("/api/providers/claude/start")
@@ -496,9 +497,9 @@ def create_app(
   async def turn_status(request: Request):
     _, session = await current(request)
     return _security_headers(JSONResponse({
-      "active": turn_active(), "finishing": session.finishing,
+      "active": turns.turn_active, "finishing": session.finishing,
       "idle_expires_at": session.exchange.idle_expires_at.isoformat(),
-      "expires_at": session.expires_at.isoformat(),
+      "expires_at": session.exchange.expires_at.isoformat(),
       "idle_timeout_seconds": session.exchange.idle_timeout_seconds,
     }))
 
@@ -513,7 +514,9 @@ def create_app(
       raise ProtocolError("invalid_request", "Message and provider are required.", 400)
 
     async def events():
-      iterator = stream_turn(message, provider, session, providers, workspaces).__aiter__()
+      iterator = stream_turn(
+        message, provider, session, providers, workspaces, turns
+      ).__aiter__()
       async for frame in _sse_events(iterator):
         yield frame
 
@@ -524,13 +527,12 @@ def create_app(
   def finish_response(progress: dict):
     response = JSONResponse(progress)
     if progress.get("status") == "finished":
-      outcome = str(progress.get("outcome") or "recovered")
       response.delete_cookie(
         COOKIE_NAME, path="/", secure=settings.secure_cookie,
         httponly=True, samesite="strict",
       )
       response.set_cookie(
-        CLOSED_COOKIE, outcome, max_age=600, path="/",
+        CLOSED_COOKIE, "1", max_age=600, path="/",
         secure=settings.secure_cookie, httponly=True, samesite="strict",
       )
     return _security_headers(response)
@@ -540,12 +542,13 @@ def create_app(
     _same_origin(request)
     token, session = await current(request)
     payload = await _json_body(request)
-    outcome = payload.get("outcome")
-    if outcome not in {"recovered", "cancelled"}:
-      raise ProtocolError("invalid_outcome", "Outcome is invalid.", 400)
-    if not session.finishing and not claim_finish():
+    if payload:
+      raise ProtocolError(
+        "invalid_request", "End Recovery does not accept request fields.", 400
+      )
+    if not session.finishing and not turns.begin_finish():
       raise ProtocolError("finish_in_progress", "Recovery is already closing.", 409)
-    progress = await asyncio.to_thread(sessions.begin_finish, token, outcome)
+    progress = await asyncio.to_thread(sessions.begin_finish, token)
     return finish_response(progress)
 
   @app.get("/api/finish/status")

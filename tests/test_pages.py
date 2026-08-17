@@ -6,7 +6,7 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
-from recovery_worker.pages import _SCRIPT, recovery_page
+from recovery_worker.pages import _SCRIPT, closed_page, recovery_page
 
 
 @pytest.mark.skipif(shutil.which("node") is None, reason="Node is unavailable")
@@ -40,7 +40,7 @@ def test_recovery_page_has_one_end_action_and_an_explicit_idle_policy() -> None:
   now = datetime.now(timezone.utc)
   page = recovery_page(
     "nonce",
-    protocol_version="mobius-recovery-worker/v2",
+    protocol_version="mobius-recovery-worker/v3",
     build_sha="a" * 40,
     session_id="rec_test",
     idle_expires_at=now + timedelta(minutes=20),
@@ -54,6 +54,14 @@ def test_recovery_page_has_one_end_action_and_an_explicit_idle_policy() -> None:
   assert "Secure remote access" in page
   assert "stops any active recovery agent" in page
   assert "const initialSession = null;" not in page
+  assert 'id="messages" aria-live=' not in page
+
+
+def test_closed_page_has_one_final_state() -> None:
+  page = closed_page("nonce", return_url="https://mobius.example")
+  assert "Recovery finished." in page
+  assert "cancel" not in page.lower()
+  assert "outcome" not in page.lower()
 
 
 def test_end_recovery_remains_available_while_agent_is_working() -> None:

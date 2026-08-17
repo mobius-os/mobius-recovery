@@ -9,7 +9,7 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 
-WORKER_PROTOCOL_VERSION = "mobius-recovery-worker/v2"
+WORKER_PROTOCOL_VERSION = "mobius-recovery-worker/v3"
 STATE_DIR = Path(os.environ.get("MOBIUS_RECOVERY_STATE_DIR", "/state"))
 BUILD_REVISION_PATH = Path(__file__).resolve().parents[1] / "BUILD_REVISION"
 MANAGED_INSTANCE_ID = re.compile(r"mob_[A-Za-z0-9_-]{3,80}\Z")

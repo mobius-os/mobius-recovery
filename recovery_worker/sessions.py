@@ -34,22 +34,21 @@ class Message:
 class RecoverySession:
   session_id: str
   exchange: ExchangeResult
-  expires_at: datetime
   messages: list[Message] = field(default_factory=list)
   readiness_error: str | None = None
-  finish_outcome: str | None = None
   provider_generation: int | None = None
   workspace: Path | None = None
   _history_chars: int = field(default=0, init=False, repr=False)
   _messages_lock: threading.Lock = field(default_factory=threading.Lock, init=False, repr=False)
   _revoked: bool = field(default=False, init=False, repr=False)
   _revoke_lock: threading.Lock = field(default_factory=threading.Lock, init=False, repr=False)
+  _finishing: bool = field(default=False, init=False, repr=False)
   _finish_lock: threading.Lock = field(default_factory=threading.Lock, init=False, repr=False)
 
   @property
   def finishing(self) -> bool:
     with self._finish_lock:
-      return self.finish_outcome is not None
+      return self._finishing
 
   @property
   def revoked(self) -> bool:
@@ -115,7 +114,9 @@ class SessionStore:
       self._expiry_timer = None
     if not self._sessions:
       return
-    deadline = min(session.expires_at for session in self._sessions.values())
+    deadline = min(
+      session.exchange.expires_at for session in self._sessions.values()
+    )
     delay = max(0.0, (deadline - datetime.now(timezone.utc)).total_seconds())
     self._expiry_timer = threading.Timer(delay, self.expire)
     self._expiry_timer.daemon = True
@@ -147,7 +148,6 @@ class SessionStore:
       session = RecoverySession(
         session_id=exchange.session_id,
         exchange=exchange,
-        expires_at=exchange.expires_at,
       )
     except Exception:
       with self._lock:
@@ -166,6 +166,10 @@ class SessionStore:
     try:
       self._control.acknowledge(exchange)
     except ProtocolError:
+      # The launcher keeps an encrypted exchange receipt specifically so a
+      # lost acknowledgement cannot strand the owner after the code exchange.
+      # This worker still rejects the consumed code locally and server-side
+      # expiry remains the cleanup authority.
       pass
     return browser_token, session
 
@@ -180,7 +184,11 @@ class SessionStore:
     digest = self._digest(browser_token)
     with self._lock:
       session = self._sessions.get(digest)
-      if session and not session.revoked and session.expires_at > datetime.now(timezone.utc):
+      if (
+        session
+        and not session.revoked
+        and session.exchange.expires_at > datetime.now(timezone.utc)
+      ):
         return session
       if session:
         self._sessions.pop(digest, None)
@@ -195,7 +203,7 @@ class SessionStore:
       self._expiry_timer = None
       expired = [
         (digest, session) for digest, session in self._sessions.items()
-        if session.expires_at <= now
+        if session.exchange.expires_at <= now
       ]
       for digest, _session in expired:
         self._sessions.pop(digest, None)
@@ -214,24 +222,18 @@ class SessionStore:
     for session in sessions:
       self._revoke(session, "shutdown")
 
-  def begin_finish(
-    self,
-    browser_token: str,
-    outcome: str,
-  ) -> dict:
+  def begin_finish(self, browser_token: str) -> dict:
     digest = self._digest(browser_token)
     with self._lock:
       session = self._sessions.get(digest)
     if not session:
       raise ProtocolError("auth_failed", "Recovery session expired.", 401)
     with session._finish_lock:
-      if session.finish_outcome and session.finish_outcome != outcome:
-        raise ProtocolError("finish_outcome_conflict", "Recovery is already closing.", 409)
-      first = session.finish_outcome is None
-      session.finish_outcome = outcome
+      first = not session._finishing
+      session._finishing = True
     if first and self._on_finish_accepted:
       self._on_finish_accepted(session)
-    result = self._control.finish(session.exchange, outcome)
+    result = self._control.finish(session.exchange)
     with self._lock:
       if self._sessions.get(digest) is session:
         self._sessions.pop(digest, None)
@@ -241,6 +243,6 @@ class SessionStore:
 
   def poll_finish(self, browser_token: str) -> dict:
     session = self.get(browser_token)
-    if not session or not session.finish_outcome:
+    if not session or not session.finishing:
       raise ProtocolError("finish_not_started", "Recovery is not closing.", 409)
-    return self.begin_finish(browser_token, session.finish_outcome)
+    return self.begin_finish(browser_token)
