@@ -46,3 +46,6 @@ copy makes clear that local access remains closed and a fresh launch is needed.
 The visible page quietly maintains its ephemeral serverless session. If the
 worker restarts after inactivity, any stale authenticated page returns to a
 dedicated fresh-launch explanation; it never invites reuse of a consumed code.
+The context rail shows the server-issued idle countdown and explains that
+activity renews it only up to the one-hour session maximum. The conversation
+shows an elapsed, named activity line before the provider emits its first token.

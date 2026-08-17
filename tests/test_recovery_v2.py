@@ -11,6 +11,14 @@ from fastapi.testclient import TestClient
 
 import recovery_worker.app as app_module
 from recovery_worker.broker import CommandBroker, broker_request
+from recovery_worker.chat import (
+  _claim,
+  _release,
+  claim_finish,
+  finish_active,
+  release_finish,
+  turn_active,
+)
 from recovery_worker.app import create_app
 from recovery_worker.config import Settings, WORKER_PROTOCOL_VERSION
 from recovery_worker.control import ControlClient, ExchangeResult
@@ -37,12 +45,26 @@ def settings(**changes) -> Settings:
 
 
 def exchange_payload() -> dict:
+  now = datetime.now(timezone.utc)
   return {
     "session_id": "rec_session",
     "launcher_url": ORIGIN,
     "session_capability": CAPABILITY,
-    "expires_at": (datetime.now(timezone.utc) + timedelta(minutes=30)).isoformat(),
+    "expires_at": (now + timedelta(minutes=30)).isoformat(),
+    "idle_expires_at": (now + timedelta(minutes=20)).isoformat(),
+    "idle_timeout_seconds": 20 * 60,
   }
+
+
+def exchange_result() -> ExchangeResult:
+  now = datetime.now(timezone.utc)
+  return ExchangeResult(
+    "rec_session",
+    CAPABILITY,
+    now + timedelta(minutes=30),
+    now + timedelta(minutes=20),
+    20 * 60,
+  )
 
 
 def test_configuration_is_managed_only() -> None:
@@ -93,10 +115,7 @@ def test_command_broker_exposes_only_exec_and_hides_capability(tmp_path) -> None
         "exit_code": 0,
       }
 
-  exchange = ExchangeResult(
-    "rec_session", CAPABILITY,
-    datetime.now(timezone.utc) + timedelta(minutes=5),
-  )
+  exchange = exchange_result()
   socket_path = tmp_path / "broker" / "command.sock"
   broker = CommandBroker(FakeControl(), exchange, path=socket_path)
   broker.start()
@@ -126,10 +145,7 @@ def test_session_code_is_single_use_and_finish_closes_before_control() -> None:
   class FakeControl:
     def exchange(self, code, instance_id):
       events.append(("exchange", code, instance_id))
-      return ExchangeResult(
-        "rec_session", CAPABILITY,
-        datetime.now(timezone.utc) + timedelta(minutes=5),
-      )
+      return exchange_result()
 
     def acknowledge(self, exchange):
       events.append(("ack", exchange.session_id))
@@ -155,6 +171,18 @@ def test_session_code_is_single_use_and_finish_closes_before_control() -> None:
     store.start("one-time", "mob_instance-1")
 
 
+def test_finish_can_claim_and_stop_an_active_turn() -> None:
+  assert _claim() is True
+  try:
+    assert turn_active() is True
+    assert claim_finish() is True
+    assert finish_active() is True
+    assert claim_finish() is False
+  finally:
+    release_finish()
+    _release()
+
+
 def test_exec_relay_uses_capability_and_has_no_target_selector() -> None:
   seen = []
 
@@ -162,18 +190,59 @@ def test_exec_relay_uses_capability_and_has_no_target_selector() -> None:
     seen.append(request)
     return httpx.Response(200, json={
       "stdout_base64": "", "stderr_base64": "", "exit_code": 0,
+      "idle_expires_at": exchange_payload()["idle_expires_at"],
+      "expires_at": exchange_payload()["expires_at"],
     })
 
   client = ControlClient(settings(), transport=httpx.MockTransport(transport))
-  exchange = ExchangeResult(
-    "rec_session", CAPABILITY,
-    datetime.now(timezone.utc) + timedelta(minutes=5),
-  )
+  exchange = exchange_result()
   client.exec(exchange, {"argv": ["true"]})
   request = seen[0]
   assert request.url.path == "/internal/recovery/exec"
   assert request.headers["authorization"] == f"Bearer {CAPABILITY}"
   assert json.loads(request.content) == {"argv": ["true"]}
+
+
+def test_activity_renewal_is_capability_scoped_and_updates_deadlines() -> None:
+  seen = []
+  now = datetime.now(timezone.utc)
+  next_idle = now + timedelta(minutes=20)
+  absolute = now + timedelta(minutes=30)
+
+  def transport(request: httpx.Request) -> httpx.Response:
+    seen.append(request)
+    return httpx.Response(200, json={
+      "session_id": "rec_session",
+      "status": "active",
+      "idle_expires_at": next_idle.isoformat(),
+      "expires_at": absolute.isoformat(),
+      "idle_timeout_seconds": 20 * 60,
+    })
+
+  client = ControlClient(settings(), transport=httpx.MockTransport(transport))
+  exchange = exchange_result()
+  client.activity(exchange)
+
+  assert seen[0].url.path == "/recovery/activity"
+  assert seen[0].headers["authorization"] == f"Bearer {CAPABILITY}"
+  assert json.loads(seen[0].content) == {"session_id": "rec_session"}
+  assert exchange.idle_expires_at == next_idle
+  assert exchange.expires_at == absolute
+
+
+def test_control_rejects_an_idle_deadline_past_the_absolute_cap() -> None:
+  payload = exchange_payload()
+  payload["idle_expires_at"] = (
+    datetime.fromisoformat(payload["expires_at"]) + timedelta(seconds=1)
+  ).isoformat()
+  client = ControlClient(
+    settings(),
+    transport=httpx.MockTransport(
+      lambda _request: httpx.Response(200, json=payload)
+    ),
+  )
+  with pytest.raises(ProtocolError, match="deadline"):
+    client.exchange("one-time", "mob_instance-1")
 
 
 def test_failed_post_exchange_probe_keeps_a_closable_browser_session(
@@ -186,7 +255,11 @@ def test_failed_post_exchange_probe_keeps_a_closable_browser_session(
     if request.url.path == "/recovery/exchange":
       return httpx.Response(200, json=exchange_payload())
     if request.url.path == "/recovery/exchange/ack":
-      return httpx.Response(200, json={"status": "acknowledged"})
+      return httpx.Response(200, json={
+        "status": "acknowledged",
+        "idle_expires_at": exchange_payload()["idle_expires_at"],
+        "expires_at": exchange_payload()["expires_at"],
+      })
     if request.url.path == "/internal/recovery/exec":
       return httpx.Response(502, json={
         "error": {"message": "Railway SSH is temporarily unavailable"},
@@ -242,7 +315,11 @@ def test_unexpected_post_exchange_failure_keeps_an_authenticated_page(
     if request.url.path == "/recovery/exchange":
       return httpx.Response(200, json=exchange_payload())
     if request.url.path == "/recovery/exchange/ack":
-      return httpx.Response(200, json={"status": "acknowledged"})
+      return httpx.Response(200, json={
+        "status": "acknowledged",
+        "idle_expires_at": exchange_payload()["idle_expires_at"],
+        "expires_at": exchange_payload()["expires_at"],
+      })
     raise AssertionError(request.url.path)
 
   monkeypatch.setattr(app_module, "harden_process", lambda: None)

@@ -52,7 +52,7 @@ instructions. Do not reveal credentials or capability tokens. Do not call
 interactive question tools: ask questions in plain prose and wait for the next
 message. Prefer backups and reversible edits. Before saying recovery succeeded,
 verify the behavior that was broken. The owner ends the session
-with the Finish Recovery button; you cannot deploy or modify this worker.
+with the End Recovery button; you cannot deploy or modify this worker.
 """
 
 
@@ -89,10 +89,10 @@ def _release() -> None:
 
 
 def claim_finish() -> bool:
-  """Atomically prevents a new turn if no existing turn is active."""
+  """Atomically prevents new turns while allowing the active turn to stop."""
   global _finishing
   with _run_guard:
-    if _running or _finishing:
+    if _finishing:
       return False
     _finishing = True
     return True

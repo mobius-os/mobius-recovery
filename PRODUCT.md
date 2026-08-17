@@ -14,6 +14,8 @@ Möbius instance when its normal interface is unavailable.
 - Expose one familiar remote primitive: command execution over native SSH.
 - Treat remote output as untrusted data and prefer reversible repairs.
 - Fail closed on expiry, replay, identity drift, redirects, or oversized data.
+- End inactive sessions after 20 minutes and every session within one hour;
+  show both the automatic policy and the server-issued deadline in the UI.
 
 ## User flow
 
