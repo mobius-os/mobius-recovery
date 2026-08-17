@@ -8,21 +8,20 @@ import os
 import secrets
 import shutil
 import signal
-import socket
 import stat
 import subprocess
 import threading
 import time
-import urllib.error
-import urllib.request
 from base64 import urlsafe_b64encode
 from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
 from urllib.parse import parse_qs, urlencode, urlparse
 
+import httpx
+
 from .codex_login_parse import banner_has_code, parse_login_banner
-from .config import STATE_DIR
+from .config import STATE_DIR, WORKER_PROTOCOL_VERSION
 from .protocol import ProtocolError
 
 
@@ -38,6 +37,8 @@ _SCOPES = (
   "org:create_api_key user:profile user:inference "
   "user:sessions:claude_code user:mcp_servers user:file_upload"
 )
+_MAX_PROVIDER_RESPONSE_BYTES = 1024 * 1024
+_CLAUDE_TOKEN_REFRESH_MARGIN_MS = 60_000
 
 
 def _process_table() -> dict[int, tuple[int, str]]:
@@ -135,9 +136,11 @@ def subprocess_env() -> dict[str, str]:
 class ProviderAuth:
   """Owns provider login state for this worker process only."""
 
-  def __init__(self) -> None:
+  def __init__(self, *, claude_transport: httpx.BaseTransport | None = None) -> None:
     self._pkce: dict | None = None
     self._pkce_lock = threading.Lock()
+    self._claude_refresh_lock = threading.Lock()
+    self._claude_transport = claude_transport
     self._codex: dict = {"proc": None, "result": None, "output": ""}
     self._codex_lock = threading.Lock()
     self._state_lock = threading.Lock()
@@ -181,9 +184,137 @@ class ProviderAuth:
       if not self._enabled:
         return {"claude": False, "codex": False}
     return {
-      "claude": (CLAUDE_DIR / ".credentials.json").is_file(),
+      "claude": self._claude_credentials_usable(),
       "codex": (CODEX_DIR / "auth.json").is_file(),
     }
+
+  @staticmethod
+  def _claude_document() -> tuple[dict, dict] | None:
+    path = CLAUDE_DIR / ".credentials.json"
+    try:
+      if path.stat().st_size > _MAX_PROVIDER_RESPONSE_BYTES:
+        return None
+      document = json.loads(path.read_text(encoding="utf-8"))
+    except (FileNotFoundError, OSError, UnicodeError, ValueError):
+      return None
+    oauth = document.get("claudeAiOauth") if isinstance(document, dict) else None
+    if not isinstance(oauth, dict):
+      return None
+    return document, oauth
+
+  @staticmethod
+  def _nonempty(value: object) -> bool:
+    return isinstance(value, str) and bool(value.strip())
+
+  @classmethod
+  def _claude_access_current(cls, oauth: dict, *, margin_ms: int = 0) -> bool:
+    expires_at = oauth.get("expiresAt")
+    return (
+      cls._nonempty(oauth.get("accessToken"))
+      and isinstance(expires_at, (int, float))
+      and not isinstance(expires_at, bool)
+      and expires_at - time.time() * 1000 >= margin_ms
+    )
+
+  @classmethod
+  def _claude_can_refresh(cls, oauth: dict) -> bool:
+    refresh_expires_at = oauth.get("refreshTokenExpiresAt")
+    return cls._nonempty(oauth.get("refreshToken")) and (
+      "refreshTokenExpiresAt" not in oauth
+      or (
+        isinstance(refresh_expires_at, (int, float))
+        and not isinstance(refresh_expires_at, bool)
+        and refresh_expires_at > time.time() * 1000
+      )
+    )
+
+  @classmethod
+  def _claude_credentials_usable(cls) -> bool:
+    loaded = cls._claude_document()
+    if loaded is None:
+      return False
+    _document, oauth = loaded
+    return cls._claude_access_current(oauth) or cls._claude_can_refresh(oauth)
+
+  @staticmethod
+  def _token_credentials(token_data: dict, previous: dict | None = None) -> dict:
+    previous = previous or {}
+    access_token = token_data.get("access_token")
+    refresh_token = token_data.get("refresh_token")
+    expires_in = token_data.get("expires_in")
+    if (
+      not isinstance(access_token, str)
+      or not access_token.strip()
+      or not isinstance(refresh_token, str)
+      or not refresh_token.strip()
+      or not isinstance(expires_in, (int, float))
+      or isinstance(expires_in, bool)
+      or expires_in <= 0
+    ):
+      raise ProtocolError(
+        "provider_invalid", "Claude token response is incomplete.", 502
+      )
+    credentials = dict(previous)
+    credentials.update({
+      "accessToken": access_token,
+      "refreshToken": refresh_token,
+      "expiresAt": int(time.time() * 1000 + expires_in * 1000),
+    })
+    scope = token_data.get("scope")
+    if isinstance(scope, str):
+      credentials["scopes"] = scope.split()
+    account = token_data.get("account")
+    if isinstance(account, dict) and isinstance(account.get("email_address"), str):
+      credentials["email"] = account["email_address"]
+    refresh_expires_in = token_data.get("refresh_token_expires_in")
+    if (
+      isinstance(refresh_expires_in, (int, float))
+      and not isinstance(refresh_expires_in, bool)
+      and refresh_expires_in > 0
+    ):
+      credentials["refreshTokenExpiresAt"] = int(
+        time.time() * 1000 + refresh_expires_in * 1000
+      )
+    return credentials
+
+  def _claude_tokens(self, payload: dict, *, refreshing: bool) -> dict:
+    try:
+      with httpx.Client(
+        timeout=30.0,
+        trust_env=False,
+        transport=self._claude_transport,
+        headers={"User-Agent": WORKER_PROTOCOL_VERSION},
+      ) as client:
+        response = client.post(_TOKEN_URL, json=payload)
+        if len(response.content) > _MAX_PROVIDER_RESPONSE_BYTES:
+          raise ProtocolError(
+            "provider_response_too_large", "Claude response is too large.", 502
+          )
+        response.raise_for_status()
+    except httpx.HTTPStatusError as exc:
+      if exc.response.status_code == 429:
+        message = "Claude is rate limiting authorization. Wait a moment and try again."
+      elif refreshing:
+        message = "Claude authorization expired. Reconnect Claude and retry."
+      else:
+        message = (
+          "Claude rejected that authorization code. Start a new Claude "
+          "connection and paste the newest code."
+        )
+      raise ProtocolError("provider_rejected", message, 502) from exc
+    except httpx.TimeoutException as exc:
+      raise ProtocolError("provider_timeout", "Claude login timed out.", 504) from exc
+    except httpx.RequestError as exc:
+      raise ProtocolError(
+        "provider_unavailable", "Claude authorization could not be reached.", 502
+      ) from exc
+    try:
+      token_data = response.json()
+    except ValueError as exc:
+      raise ProtocolError("provider_invalid", "Claude returned invalid data.", 502) from exc
+    if not isinstance(token_data, dict):
+      raise ProtocolError("provider_invalid", "Claude returned invalid data.", 502)
+    return token_data
 
   def claude_start(self) -> dict:
     generation = self.active_generation()
@@ -239,62 +370,75 @@ class ProviderAuth:
       returned_state, pkce["state"]
     ):
       raise ProtocolError("state_mismatch", "Claude login state mismatch.", 403)
-    body = json.dumps({
+    body = {
       "grant_type": "authorization_code",
       "code": code,
       "client_id": _CLAUDE_CLIENT_ID,
       "redirect_uri": _REDIRECT_URI,
       "code_verifier": pkce["verifier"],
       "state": pkce["state"],
-    }).encode("utf-8")
-    request = urllib.request.Request(
-      _TOKEN_URL,
-      data=body,
-      headers={"Content-Type": "application/json"},
-      method="POST",
-    )
-    try:
-      # Ignore process proxy variables. Railway service variables are mutable
-      # deployment input and must not receive OAuth codes or provider tokens.
-      opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
-      with opener.open(request, timeout=30) as response:
-        try:
-          response_length = int(
-            response.headers.get("content-length", "0") or 0
-          )
-        except (TypeError, ValueError) as exc:
-          raise ProtocolError(
-            "provider_invalid", "Claude returned invalid response metadata."
-          ) from exc
-        if response_length > 1024 * 1024:
-          raise ProtocolError("provider_response_too_large", "Claude response is too large")
-        raw_response = response.read(1024 * 1024 + 1)
-        if len(raw_response) > 1024 * 1024:
-          raise ProtocolError(
-            "provider_response_too_large", "Claude response is too large"
-          )
-        token_data = json.loads(raw_response.decode("utf-8"))
-    except urllib.error.HTTPError as exc:
-      raise ProtocolError("provider_rejected", "Claude rejected the login.", 502) from exc
-    except (urllib.error.URLError, socket.timeout) as exc:
-      raise ProtocolError("provider_timeout", "Claude login timed out.", 504) from exc
-    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-      raise ProtocolError("provider_invalid", "Claude returned invalid data.", 502) from exc
-    for field in ("access_token", "refresh_token", "expires_in"):
-      if field not in token_data:
-        raise ProtocolError("provider_invalid", "Claude token response is incomplete.")
+    }
+    token_data = self._claude_tokens(body, refreshing=False)
     credentials = {
-      "claudeAiOauth": {
-        "accessToken": token_data["access_token"],
-        "refreshToken": token_data["refresh_token"],
-        "expiresAt": int(time.time() * 1000) + int(token_data["expires_in"]) * 1000,
-        "scopes": str(token_data.get("scope", "")).split(),
-        "email": (token_data.get("account") or {}).get("email_address", ""),
-      }
+      "claudeAiOauth": self._token_credentials(token_data)
     }
     self._private_json(
       CLAUDE_DIR / ".credentials.json", credentials, generation
     )
+
+  def invalidate_claude(self, generation: int) -> None:
+    with self._state_lock:
+      if not self._enabled or generation != self._generation:
+        return
+      try:
+        (CLAUDE_DIR / ".credentials.json").unlink()
+      except FileNotFoundError:
+        pass
+
+  def ensure_claude(self, generation: int) -> None:
+    """Hands each turn a current token and serializes rotating refresh grants."""
+    with self._claude_refresh_lock:
+      with self._state_lock:
+        if not self._enabled or generation != self._generation:
+          raise ProtocolError(
+            "auth_expired", "Recovery provider session is closed.", 401
+          )
+      loaded = self._claude_document()
+      if loaded is None:
+        raise ProtocolError(
+          "provider_auth_required", "Connect Claude before sending.", 401
+        )
+      document, oauth = loaded
+      if self._claude_access_current(
+        oauth, margin_ms=_CLAUDE_TOKEN_REFRESH_MARGIN_MS
+      ):
+        return
+      if not self._claude_can_refresh(oauth):
+        self.invalidate_claude(generation)
+        raise ProtocolError(
+          "provider_auth_required",
+          "Claude authorization expired. Reconnect Claude and retry.",
+          401,
+        )
+      try:
+        token_data = self._claude_tokens({
+          "grant_type": "refresh_token",
+          "refresh_token": oauth["refreshToken"],
+          "client_id": _CLAUDE_CLIENT_ID,
+        }, refreshing=True)
+      except ProtocolError as exc:
+        if exc.code == "provider_rejected":
+          self.invalidate_claude(generation)
+          raise ProtocolError(
+            "provider_auth_required",
+            "Claude authorization expired. Reconnect Claude and retry.",
+            401,
+          ) from exc
+        raise
+      document["claudeAiOauth"] = self._token_credentials(token_data, oauth)
+      self._private_json(
+        CLAUDE_DIR / ".credentials.json", document, generation
+      )
 
   def _private_json(self, path: Path, value: dict, generation: int) -> None:
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)

@@ -9,29 +9,21 @@ import time
 from urllib.parse import parse_qs, urlparse
 
 import pytest
+import httpx
 
 from recovery_worker import providers
 from recovery_worker.providers import ProviderAuth
 from recovery_worker.protocol import ProtocolError
 
 
-class _Response:
-  headers = {"content-length": "256"}
-
-  def __enter__(self):
-    return self
-
-  def __exit__(self, *_args):
-    return False
-
-  def read(self, _limit: int) -> bytes:
-    return json.dumps({
-      "access_token": "access",
-      "refresh_token": "refresh",
-      "expires_in": 3600,
-      "scope": "user:inference",
-      "account": {"email_address": "owner@example.com"},
-    }).encode()
+def _token_response() -> httpx.Response:
+  return httpx.Response(200, json={
+    "access_token": "access",
+    "refresh_token": "refresh",
+    "expires_in": 3600,
+    "scope": "user:inference",
+    "account": {"email_address": "owner@example.com"},
+  })
 
 
 def test_provider_environment_excludes_worker_and_proxy_secrets(monkeypatch) -> None:
@@ -55,26 +47,30 @@ def test_claude_pkce_uses_no_proxy_and_ephemeral_private_credentials(
   monkeypatch.setattr(providers, "CLAUDE_DIR", claude_dir)
   seen: dict = {}
 
-  class Opener:
-    def open(self, request, timeout):
-      seen["url"] = request.full_url
-      seen["timeout"] = timeout
-      return _Response()
+  def exchange(request: httpx.Request) -> httpx.Response:
+    seen["request"] = request
+    return _token_response()
 
-  def build_opener(*handlers):
-    seen["handlers"] = handlers
-    return Opener()
+  real_client = httpx.Client
 
-  monkeypatch.setattr(providers.urllib.request, "build_opener", build_opener)
+  def client(*args, **kwargs):
+    seen["trust_env"] = kwargs.get("trust_env")
+    seen["timeout"] = kwargs.get("timeout")
+    return real_client(*args, **{
+      **kwargs, "transport": httpx.MockTransport(exchange),
+    })
+
+  monkeypatch.setattr(providers.httpx, "Client", client)
   auth = ProviderAuth()
   started = auth.claude_start()
   state = parse_qs(urlparse(started["auth_url"]).query)["state"][0]
   auth.claude_exchange(f"authorization-code#state={state}")
 
-  assert seen["url"] == "https://platform.claude.com/v1/oauth/token"
-  assert seen["timeout"] == 30
-  assert len(seen["handlers"]) == 1
-  assert seen["handlers"][0].proxies == {}
+  request = seen["request"]
+  assert str(request.url) == "https://platform.claude.com/v1/oauth/token"
+  assert request.headers["user-agent"] == providers.WORKER_PROTOCOL_VERSION
+  assert seen["timeout"] == 30.0
+  assert seen["trust_env"] is False
   credential = claude_dir / ".credentials.json"
   assert credential.stat().st_mode & 0o777 == 0o600
   assert json.loads(credential.read_text())["claudeAiOauth"]["accessToken"] == "access"
@@ -130,18 +126,12 @@ def test_clear_prevents_inflight_claude_exchange_from_recreating_credentials(
   entered = threading.Event()
   release = threading.Event()
 
-  class Opener:
-    def open(self, _request, _timeout=None, **_kwargs):
-      entered.set()
-      assert release.wait(3)
-      return _Response()
+  def exchange(_request: httpx.Request) -> httpx.Response:
+    entered.set()
+    assert release.wait(3)
+    return _token_response()
 
-  monkeypatch.setattr(
-    providers.urllib.request,
-    "build_opener",
-    lambda *_handlers: Opener(),
-  )
-  auth = ProviderAuth()
+  auth = ProviderAuth(claude_transport=httpx.MockTransport(exchange))
   started = auth.claude_start()
   state = parse_qs(urlparse(started["auth_url"]).query)["state"][0]
   errors: list[Exception] = []
@@ -163,6 +153,75 @@ def test_clear_prevents_inflight_claude_exchange_from_recreating_credentials(
   assert isinstance(errors[0], ProtocolError)
   assert errors[0].code == "auth_expired"
   assert not (claude_dir / ".credentials.json").exists()
+
+
+def test_claude_status_requires_usable_credentials(tmp_path, monkeypatch) -> None:
+  claude_dir = tmp_path / "providers" / "claude"
+  monkeypatch.setattr(providers, "CLAUDE_DIR", claude_dir)
+  claude_dir.mkdir(parents=True)
+  credential = claude_dir / ".credentials.json"
+  auth = ProviderAuth()
+
+  credential.write_text("{}")
+  assert auth.status()["claude"] is False
+
+  credential.write_text(json.dumps({
+    "claudeAiOauth": {
+      "accessToken": "expired",
+      "expiresAt": 0,
+    }
+  }))
+  assert auth.status()["claude"] is False
+
+  credential.write_text(json.dumps({
+    "claudeAiOauth": {
+      "accessToken": "expired",
+      "refreshToken": "refresh",
+      "expiresAt": 0,
+    }
+  }))
+  assert auth.status()["claude"] is True
+
+
+def test_claude_refreshes_before_turn_and_persists_rotation(
+  tmp_path, monkeypatch,
+) -> None:
+  claude_dir = tmp_path / "providers" / "claude"
+  monkeypatch.setattr(providers, "CLAUDE_DIR", claude_dir)
+  claude_dir.mkdir(parents=True)
+  credential = claude_dir / ".credentials.json"
+  credential.write_text(json.dumps({
+    "claudeAiOauth": {
+      "accessToken": "expired",
+      "refreshToken": "refresh-a",
+      "expiresAt": 0,
+      "scopes": ["user:inference"],
+    },
+    "organizationUuid": "org-preserved",
+  }))
+  seen: dict = {}
+
+  def refresh(request: httpx.Request) -> httpx.Response:
+    seen["body"] = json.loads(request.content)
+    return httpx.Response(200, json={
+      "access_token": "access-b",
+      "refresh_token": "refresh-b",
+      "expires_in": 3600,
+    })
+
+  auth = ProviderAuth(claude_transport=httpx.MockTransport(refresh))
+  generation = auth.active_generation()
+  auth.ensure_claude(generation)
+
+  assert seen["body"] == {
+    "grant_type": "refresh_token",
+    "refresh_token": "refresh-a",
+    "client_id": providers._CLAUDE_CLIENT_ID,
+  }
+  saved = json.loads(credential.read_text())
+  assert saved["claudeAiOauth"]["accessToken"] == "access-b"
+  assert saved["claudeAiOauth"]["refreshToken"] == "refresh-b"
+  assert saved["organizationUuid"] == "org-preserved"
 
 
 def test_replaced_session_generation_cannot_launch_provider_process() -> None:

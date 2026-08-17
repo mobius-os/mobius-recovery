@@ -217,6 +217,8 @@ async def _spawn(
       raise ProtocolError(
         "auth_expired", "Recovery provider session is closed.", 401
       )
+    if provider == "claude":
+      await asyncio.to_thread(provider_auth.ensure_claude, generation)
     # clear() takes this same guard before disabling the generation. If
     # revocation wins, no child starts; if launch wins, cleanup observes and
     # kills the registered descendant before it returns.
@@ -236,7 +238,7 @@ async def _spawn(
         start_new_session=True,
       )
   except ProtocolError as exc:
-    yield {"type": "error", "message": exc.message}
+    yield {"type": "error", "code": exc.code, "message": exc.message}
     return
   except OSError:
     yield {"type": "error", "message": f"{provider} CLI could not start."}
@@ -303,8 +305,13 @@ async def _spawn(
     if proc.returncode not in {0, None}:
       detail = stderr.decode("utf-8", "replace").strip()[:1000]
       if "auth" in detail.lower() or "login" in detail.lower():
+        await asyncio.to_thread(provider_auth.invalidate_claude, generation)
         detail = f"{provider.title()} authentication failed. Reconnect it and retry."
-      yield {"type": "error", "message": detail or f"{provider} exited unexpectedly."}
+        yield {
+          "type": "error", "code": "provider_auth_required", "message": detail,
+        }
+      else:
+        yield {"type": "error", "message": detail or f"{provider} exited unexpectedly."}
   finally:
     await _terminate(proc)
     if not stderr_task.done():

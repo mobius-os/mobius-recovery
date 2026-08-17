@@ -34,6 +34,7 @@ def test_browser_explains_agent_start_and_server_backed_expiry() -> None:
   assert "first response can take about a minute" in _SCRIPT
   assert "api('/api/session/activity'" in _SCRIPT
   assert "Math.min(idleDeadline, absoluteDeadline)" in _SCRIPT
+  assert "payload.code === 'provider_auth_required'" in _SCRIPT
 
 
 def test_recovery_page_has_one_end_action_and_an_explicit_idle_policy() -> None:
