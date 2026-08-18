@@ -17,8 +17,8 @@ are used only for the active composer and carry both offset and blur.
 ## Typography
 
 Use the native system UI stack for resilient, zero-request rendering. Use the
-native monospace stack only for protocol versions, device codes, and build
-identifiers. Headings use restrained negative tracking no tighter than -0.025em.
+native monospace stack only for device codes and remote commands. Headings use
+restrained negative tracking no tighter than -0.025em.
 
 ## Color tokens
 
@@ -49,3 +49,7 @@ dedicated fresh-launch explanation; it never invites reuse of a consumed code.
 The context rail shows the server-issued idle countdown and explains that
 activity renews it only up to the one-hour session maximum. The conversation
 shows an elapsed, named activity line before the provider emits its first token.
+Its elapsed time comes from the worker's turn coordinator, so revisiting the
+page does not restart it. Remote command summaries stay in their actual order
+between agent prose; internal build, protocol, and session identifiers stay out
+of the operator workspace.

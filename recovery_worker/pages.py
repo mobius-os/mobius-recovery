@@ -109,18 +109,11 @@ label { display: block; margin-bottom: 8px; font-size: .84rem; font-weight: 650;
 .provider input { accent-color: var(--accent); }
 .link-button { min-height: 44px; padding: 8px; border: 0; background: none; color: var(--focus); font-size: .8rem; }
 .link-button:disabled { color: var(--faint); cursor: default; }
-.session-details { color: var(--muted); font-size: .78rem; }
-.session-details summary { display: flex; min-height: 44px; align-items: center; cursor: pointer; color: var(--faint); }
-.facts { display: grid; gap: 10px; padding-top: 12px; }
-.fact span { display: block; }
-.fact-label { margin-bottom: 2px; color: var(--faint); font-size: .7rem; }
-.mono { overflow-wrap: anywhere; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: .74rem; }
 .rail-end { display: grid; gap: 9px; margin-top: auto; }
 .rail-end p { margin: 0; color: var(--faint); font-size: .75rem; line-height: 1.45; }
 .workspace { display: grid; min-width: 0; height: 100vh; grid-template-rows: auto minmax(0, 1fr) auto; }
 .workspace-head { display: flex; align-items: center; justify-content: space-between; gap: 16px; padding: 18px 28px; border-bottom: 1px solid var(--border); }
 .workspace-head p { margin: 3px 0 0; color: var(--muted); font-size: .82rem; }
-.remote-badge { padding: 5px 9px; border: 1px solid var(--border); border-radius: 999px; color: var(--muted); font-size: .72rem; }
 .mobile-end { display: none; }
 .messages { overflow: auto; padding: 34px max(24px, calc((100% - 760px) / 2)); }
 .empty { max-width: 630px; margin: 11vh auto 0; }
@@ -133,7 +126,9 @@ label { display: block; margin-bottom: 8px; font-size: .84rem; font-weight: 650;
 .message.error-message { color: #ffd7de; }
 .message-label { display: block; margin-bottom: 6px; color: var(--faint); font-size: .7rem; font-weight: 700; letter-spacing: .03em; }
 .tool, .agent-activity { max-width: 720px; margin: 0 auto 14px; color: var(--muted); font-size: .82rem; }
-.tool { padding-inline-start: 22px; }
+.tool { display: grid; gap: 7px; padding: 11px 13px; border: 1px solid var(--hairline); border-inline-start: 2px solid var(--accent); border-radius: 10px; background: rgba(255,255,255,.025); }
+.tool-label { color: var(--faint); font-size: .68rem; font-weight: 700; letter-spacing: .045em; text-transform: uppercase; }
+.tool-detail { margin: 0; overflow-wrap: anywhere; color: var(--text); font: .76rem/1.55 ui-monospace, SFMono-Regular, Menlo, monospace; white-space: pre-wrap; }
 .agent-activity { display: flex; align-items: flex-start; gap: 10px; padding: 2px 0 10px 4px; }
 .spinner { flex: none; width: 10px; height: 10px; margin-top: 5px; border: 1.5px solid var(--border); border-top-color: var(--accent); border-radius: 50%; animation: spin .75s linear infinite; }
 .agent-activity strong { position: relative; display: inline-block; color: var(--muted); font-weight: 500; }
@@ -170,13 +165,12 @@ dialog::backdrop { background: rgba(5,5,6,.84); }
   .session-life { padding-block: 14px; }
   .session-life p { margin: 5px 0 9px; font-size: .75rem; }
   .provider { padding: 5px 0; }
-  .session-details { display: none; }
   .rail-end { display: none; }
   .workspace { min-height: 76vh; height: auto; grid-template-rows: auto auto auto; }
   .workspace-head { padding: 16px 18px; }
-  .remote-badge { display: none; }
   .mobile-end { display: block; }
   .messages { min-height: 300px; overflow: visible; padding: 24px 18px; }
+  .messages > * { scroll-margin-bottom: 220px; }
   .empty { margin: 4vh 0; }
   .empty h1 { max-width: none; font-size: clamp(1.75rem, 8.5vw, 2rem); white-space: nowrap; }
   .empty .lede, .empty-note { display: none; }
@@ -246,16 +240,12 @@ def closed_page(
 def recovery_page(
   nonce: str,
   *,
-  protocol_version: str,
-  build_sha: str,
-  session_id: str,
   idle_expires_at: datetime,
   expires_at: datetime,
   idle_timeout_seconds: int,
   readiness_error: str | None = None,
   finishing: bool = False,
 ) -> str:
-  facts = {"protocol": protocol_version, "build": build_sha, "session": session_id}
   dot_class = "dot pending" if readiness_error or finishing else "dot"
   target_text = (
     "Finishing recovery…"
@@ -274,14 +264,10 @@ def recovery_page(
 <button class="link-button" data-connect="claude" type="button">Connect Claude</button></div>
 <div class="provider"><label class="provider-name"><input type="radio" name="provider" value="codex">Codex</label>
 <button class="link-button" data-connect="codex" type="button">Connect Codex</button></div></div></section>
-<details class="session-details"><summary>Session details</summary><div class="facts">"""
-  for label, value in facts.items():
-    body += f'<div class="fact"><span class="fact-label">{html.escape(label.title())}</span><span class="mono">{html.escape(value)}</span></div>'
-  body += f"""</div></details>
 <div class="rail-end"><p>You can close this tab. Recovery will end on its own, or you can remove the worker now.</p>
 <button class="button secondary" id="finish" type="button">End recovery</button></div></aside>
 <section class="workspace"><header class="workspace-head"><div><strong>Repair conversation</strong>
-<p id="provider-state">Checking provider connection…</p></div><span class="remote-badge">Bound target only</span><button class="link-button mobile-end" id="finish-mobile" type="button">End recovery</button></header>
+<p id="provider-state">Checking provider connection…</p></div><button class="link-button mobile-end" id="finish-mobile" type="button">End recovery</button></header>
 <div class="messages" id="messages"><div class="empty" id="empty"><h1>What needs fixing?</h1>
 <p class="lede">Describe what failed, what changed just before it, and what still works. The agent can inspect and repair only this Möbius container.</p>
 <div class="empty-note"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true"><path d="M12 3 4.5 6v5.5c0 4.5 3.1 7.6 7.5 9.5 4.4-1.9 7.5-5 7.5-9.5V6L12 3Z"/><path d="m9 12 2 2 4-4"/></svg><span>Möbius keeps running while you work. Commands use temporary root access through the fixed recovery relay.</span></div></div></div>
@@ -330,6 +316,7 @@ let absoluteDeadline = Date.parse(initialSession.expiresAt);
 let lastActivityTouch = 0;
 let activityElement;
 let activityStartedAt = 0;
+let currentTurnStartedAt = 0;
 let activityTimer;
 
 function setBusy(value) {
@@ -380,10 +367,20 @@ function addMessage(role, text, isError = false) {
   return content;
 }
 
-function addTool(name) {
+function addTool(name, detail = '') {
+  removeEmpty();
   const element = document.createElement('div');
   element.className = 'tool';
-  element.textContent = `Working remotely · ${name}`;
+  const label = document.createElement('span');
+  label.className = 'tool-label';
+  label.textContent = `Möbius target · ${name || 'Tool'}`;
+  element.append(label);
+  if (detail) {
+    const command = document.createElement('pre');
+    command.className = 'tool-detail';
+    command.textContent = detail;
+    element.append(command);
+  }
   messages.append(element);
   element.scrollIntoView({ block: 'end' });
 }
@@ -404,17 +401,18 @@ function elapsedLabel(milliseconds) {
   return `${minutes}:${String(total % 60).padStart(2, '0')}`;
 }
 
-function updateAgentActivity(label) {
-  if (!activityElement) return;
-  const headline = activityElement.querySelector('strong');
-  headline.textContent = label;
-  headline.dataset.label = label;
-}
-
-function startAgentActivity(provider, label = 'Recovery agent is starting') {
+function startAgentActivity(
+  provider,
+  label = 'Recovery agent is starting',
+  startedAt = Date.now(),
+) {
   stopAgentActivity();
   removeEmpty();
-  activityStartedAt = Date.now();
+  const candidate = Number(startedAt);
+  activityStartedAt = Number.isFinite(candidate) && candidate > 0
+    ? Math.min(candidate, Date.now())
+    : Date.now();
+  currentTurnStartedAt = activityStartedAt;
   activityElement = document.createElement('div');
   activityElement.className = 'agent-activity';
   activityElement.role = 'status';
@@ -428,17 +426,18 @@ function startAgentActivity(provider, label = 'Recovery agent is starting') {
   const detail = document.createElement('small');
   detail.setAttribute('aria-hidden', 'true');
   const providerName = provider === 'codex' ? 'Codex' : 'Claude';
-  detail.textContent = `${providerName} is connecting · 0:00 elapsed · first response can take about a minute`;
   body.append(headline, detail);
   activityElement.append(spinner, body);
   messages.append(activityElement);
   activityElement.scrollIntoView({ block: 'end' });
-  activityTimer = setInterval(() => {
+  const updateDetail = () => {
     const elapsed = Date.now() - activityStartedAt;
     detail.textContent = elapsed < 60000
       ? `${providerName} is connecting · ${elapsedLabel(elapsed)} elapsed · first response can take about a minute`
       : `Still working · ${elapsedLabel(elapsed)} elapsed`;
-  }, 1000);
+  };
+  updateDetail();
+  activityTimer = setInterval(updateDetail, 1000);
 }
 
 function stopAgentActivity() {
@@ -671,8 +670,10 @@ $('#composer').addEventListener('submit', async event => {
   setBusy(true);
   addMessage('user', text);
   input.value = '';
-  startAgentActivity(provider);
-  let assistant;
+  currentTurnStartedAt = Date.now();
+  startAgentActivity(provider, 'Recovery agent is starting', currentTurnStartedAt);
+  let assistantSegment;
+  let receivedText = false;
   let reportedError = false;
   try {
     const response = await fetch('/api/chat/stream', {
@@ -704,21 +705,29 @@ $('#composer').addEventListener('submit', async event => {
         const payload = JSON.parse(line.slice(6));
         if (payload.type === 'text') {
           stopAgentActivity();
-          if (!assistant) assistant = addMessage('assistant', '');
-          assistant.textContent += payload.content;
-          assistant.parentElement.scrollIntoView({ block: 'end' });
+          if (!assistantSegment) assistantSegment = addMessage('assistant', '');
+          assistantSegment.textContent += payload.content;
+          assistantSegment.parentElement.scrollIntoView({ block: 'end' });
+          receivedText = true;
         } else if (payload.type === 'tool') {
-          updateAgentActivity(`Working remotely · ${payload.name}`);
-          addTool(payload.name);
+          stopAgentActivity();
+          assistantSegment = null;
+          addTool(payload.name, payload.detail);
+          startAgentActivity(
+            provider,
+            'Recovery agent is continuing',
+            currentTurnStartedAt,
+          );
         } else if (payload.type === 'error') {
           stopAgentActivity();
+          assistantSegment = null;
           addMessage('assistant', payload.message, true);
           if (payload.code === 'provider_auth_required') refreshProviders();
           reportedError = true;
         }
       }
     }
-    if (!assistant && !reportedError) {
+    if (!receivedText && !reportedError) {
       stopAgentActivity();
       addMessage('assistant', 'The recovery agent finished without returning a message.', true);
     }
@@ -791,7 +800,13 @@ async function loadHistory(replace = false) {
       empty = null;
     }
     if (!replace && !empty) return;
-    data.messages.forEach(message => addMessage(message.role, message.content));
+    data.messages.forEach(message => {
+      if (message.role === 'tool') {
+        addTool(message.name, message.content);
+      } else if (message.role === 'user' || message.role === 'assistant') {
+        addMessage(message.role, message.content);
+      }
+    });
   } catch (error) {
     redirectLost(error);
   }
@@ -805,9 +820,14 @@ async function heartbeat() {
     if (data.active && !busy) {
       remoteBusy = true;
       setBusy(true);
-      startAgentActivity($('input[name=provider]:checked').value, 'Recovery agent is still working');
-      const detail = activityElement?.querySelector('small');
-      if (detail) detail.textContent = 'This page will restore the result when the active turn finishes.';
+      const provider = ['claude', 'codex'].includes(data.provider)
+        ? data.provider
+        : $('input[name=provider]:checked').value;
+      startAgentActivity(
+        provider,
+        'Recovery agent is still working',
+        data.started_at_ms,
+      );
     } else if (!data.active && remoteBusy) {
       remoteBusy = false;
       stopAgentActivity();
@@ -824,7 +844,7 @@ function heartbeatVisibility() {
   clearTimeout(targetRetryTimer);
   if (document.visibilityState === 'visible') {
     heartbeat();
-    refreshTarget();
+    if (!targetReady) refreshTarget();
     heartbeatTimer = setInterval(heartbeat, 15000);
   }
 }
@@ -849,8 +869,11 @@ if (finishing) {
   enterFinishing();
   pollFinish();
 } else {
-  loadHistory();
-  refreshProviders();
-  heartbeatVisibility();
+  async function initializeWorkspace() {
+    await loadHistory();
+    await refreshProviders();
+    heartbeatVisibility();
+  }
+  initializeWorkspace();
 }
 """

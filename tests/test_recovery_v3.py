@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import base64
 import json
 import stat
@@ -68,6 +69,26 @@ def test_configuration_is_managed_only() -> None:
     settings(control_plane_url="http://mobius.example").validate()
   with pytest.raises(TypeError):
     Settings(**{**settings().__dict__, "local_token": "legacy"})
+
+
+def test_sse_close_waits_for_the_pending_provider_event() -> None:
+  stopped = asyncio.Event()
+
+  async def provider_events():
+    try:
+      yield {"type": "text", "content": "started"}
+      await asyncio.Event().wait()
+    finally:
+      stopped.set()
+
+  async def exercise() -> None:
+    stream = app_module._sse_events(provider_events(), keepalive=0.001)
+    assert await anext(stream) == 'data: {"type":"text","content":"started"}\n\n'
+    assert await anext(stream) == ": keepalive\n\n"
+    await stream.aclose()
+    assert stopped.is_set()
+
+  asyncio.run(exercise())
 
 
 def test_exchange_returns_only_launcher_capability_and_pins_origin() -> None:
@@ -168,16 +189,25 @@ def test_session_code_is_single_use_and_finish_closes_before_control() -> None:
 def test_finish_can_claim_and_stop_an_active_turn() -> None:
   turns = TurnCoordinator()
   other_app_turns = TurnCoordinator()
-  assert turns.claim_turn() is True
-  assert turns.turn_active is True
-  assert other_app_turns.claim_turn() is True
+  before = int(datetime.now(timezone.utc).timestamp() * 1000)
+  assert turns.claim_turn("claude") is True
+  snapshot = turns.snapshot()
+  assert snapshot["active"] is True
+  assert snapshot["provider"] == "claude"
+  assert snapshot["started_at_ms"] >= before
+  assert turns.snapshot() == snapshot
+  assert other_app_turns.claim_turn("codex") is True
   other_app_turns.release_turn()
+  assert other_app_turns.snapshot() == {
+    "active": False, "provider": None, "started_at_ms": None,
+  }
   assert turns.begin_finish() is True
   assert turns.finishing is True
   assert turns.begin_finish() is False
   turns.reset()
-  assert turns.turn_active is False
+  assert turns.snapshot()["active"] is False
   assert turns.finishing is False
+  assert turns.snapshot()["started_at_ms"] is None
 
 
 def test_exec_relay_uses_capability_and_has_no_target_selector() -> None:
@@ -240,6 +270,65 @@ def test_control_rejects_an_idle_deadline_past_the_absolute_cap() -> None:
   )
   with pytest.raises(ProtocolError, match="deadline"):
     client.exchange("one-time", "mob_instance-1")
+
+
+def test_history_and_turn_status_restore_workspace_state(
+  tmp_path, monkeypatch,
+) -> None:
+  payload = exchange_payload()
+
+  def transport(request: httpx.Request) -> httpx.Response:
+    if request.url.path == "/recovery/exchange":
+      return httpx.Response(200, json=payload)
+    if request.url.path == "/recovery/exchange/ack":
+      return httpx.Response(200, json={
+        "status": "acknowledged",
+        "idle_expires_at": payload["idle_expires_at"],
+        "expires_at": payload["expires_at"],
+      })
+    if request.url.path == "/internal/recovery/exec":
+      return httpx.Response(200, json={
+        "stdout_base64": base64.b64encode(b"0\n").decode(),
+        "stderr_base64": "",
+        "exit_code": 0,
+        "idle_expires_at": payload["idle_expires_at"],
+        "expires_at": payload["expires_at"],
+      })
+    raise AssertionError(request.url.path)
+
+  monkeypatch.setattr(app_module, "harden_process", lambda: None)
+  app = create_app(
+    settings(),
+    control_transport=httpx.MockTransport(transport),
+    broker_path=tmp_path / "broker" / "command.sock",
+    workspace_root=tmp_path / "workspaces",
+  )
+  with TestClient(app, base_url="https://worker.example") as client:
+    started = client.post(
+      "/session/start",
+      data={"code": "one-time", "instance_id": "mob_instance-1"},
+      headers={"Origin": ORIGIN, "Sec-Fetch-Site": "cross-site"},
+    )
+    assert started.status_code == 200
+    session = app.state.sessions.get(client.cookies.get(COOKIE_NAME))
+    assert session is not None
+    session.add_message("assistant", "Checking now.")
+    session.add_tool("Bash", "mobius-ssh -- id -u")
+    assert app.state.turns.claim_turn("codex") is True
+
+    turn = client.get("/api/turn").json()
+    assert turn["active"] is True
+    assert turn["provider"] == "codex"
+    assert isinstance(turn["started_at_ms"], int)
+    assert client.get("/api/history").json()["messages"] == [
+      {"role": "assistant", "content": "Checking now."},
+      {
+        "role": "tool",
+        "content": "mobius-ssh -- id -u",
+        "name": "Bash",
+      },
+    ]
+    app.state.turns.release_turn()
 
 
 def test_failed_post_exchange_probe_keeps_a_closable_browser_session(

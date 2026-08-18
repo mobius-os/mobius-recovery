@@ -35,15 +35,22 @@ def test_browser_explains_agent_start_and_server_backed_expiry() -> None:
   assert "api('/api/session/activity'" in _SCRIPT
   assert "Math.min(idleDeadline, absoluteDeadline)" in _SCRIPT
   assert "payload.code === 'provider_auth_required'" in _SCRIPT
+  assert "data.started_at_ms" in _SCRIPT
+  assert "if (!targetReady) refreshTarget();" in _SCRIPT
+
+
+def test_browser_keeps_tool_calls_in_transcript_order() -> None:
+  assert "assistantSegment = null;" in _SCRIPT
+  assert "addTool(payload.name, payload.detail)" in _SCRIPT
+  assert "if (message.role === 'tool')" in _SCRIPT
+  assert "command.textContent = detail" in _SCRIPT
+  assert "Working remotely" not in _SCRIPT
 
 
 def test_recovery_page_has_one_end_action_and_an_explicit_idle_policy() -> None:
   now = datetime.now(timezone.utc)
   page = recovery_page(
     "nonce",
-    protocol_version="mobius-recovery-worker/v3",
-    build_sha="a" * 40,
-    session_id="rec_test",
     idle_expires_at=now + timedelta(minutes=20),
     expires_at=now + timedelta(hours=1),
     idle_timeout_seconds=20 * 60,
@@ -56,6 +63,8 @@ def test_recovery_page_has_one_end_action_and_an_explicit_idle_policy() -> None:
   assert "stops any active recovery agent" in page
   assert "const initialSession = null;" not in page
   assert 'id="messages" aria-live=' not in page
+  assert "Session details" not in page
+  assert "Bound target only" not in page
 
 
 def test_closed_page_has_one_final_state() -> None:
