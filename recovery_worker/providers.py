@@ -41,6 +41,19 @@ _MAX_PROVIDER_RESPONSE_BYTES = 1024 * 1024
 _CLAUDE_TOKEN_REFRESH_MARGIN_MS = 60_000
 
 
+def claude_token_response(
+  payload: dict, *, transport: httpx.BaseTransport | None = None,
+) -> httpx.Response:
+  """Send a token grant through the worker's single canonical transport."""
+  with httpx.Client(
+    timeout=30.0,
+    trust_env=False,
+    transport=transport,
+    headers={"User-Agent": WORKER_PROTOCOL_VERSION},
+  ) as client:
+    return client.post(_TOKEN_URL, json=payload)
+
+
 def _process_table() -> dict[int, tuple[int, str]]:
   processes: dict[int, tuple[int, str]] = {}
   try:
@@ -279,28 +292,36 @@ class ProviderAuth:
 
   def _claude_tokens(self, payload: dict, *, refreshing: bool) -> dict:
     try:
-      with httpx.Client(
-        timeout=30.0,
-        trust_env=False,
-        transport=self._claude_transport,
-        headers={"User-Agent": WORKER_PROTOCOL_VERSION},
-      ) as client:
-        response = client.post(_TOKEN_URL, json=payload)
-        if len(response.content) > _MAX_PROVIDER_RESPONSE_BYTES:
-          raise ProtocolError(
-            "provider_response_too_large", "Claude response is too large.", 502
-          )
-        response.raise_for_status()
+      response = claude_token_response(
+        payload, transport=self._claude_transport
+      )
+      if len(response.content) > _MAX_PROVIDER_RESPONSE_BYTES:
+        raise ProtocolError(
+          "provider_response_too_large", "Claude response is too large.", 502
+        )
+      response.raise_for_status()
     except httpx.HTTPStatusError as exc:
-      if exc.response.status_code == 429:
-        message = "Claude is rate limiting authorization. Wait a moment and try again."
-      elif refreshing:
-        message = "Claude authorization expired. Reconnect Claude and retry."
-      else:
-        message = (
+      status = exc.response.status_code
+      if status == 429:
+        raise ProtocolError(
+          "provider_rate_limited",
+          "Claude is rate limiting authorization. Wait a moment and try again.",
+          429,
+        ) from exc
+      if status not in {400, 401, 403}:
+        raise ProtocolError(
+          "provider_unavailable",
+          "Claude authorization is temporarily unavailable. Try again shortly.",
+          502,
+        ) from exc
+      message = (
+        "Claude authorization expired. Reconnect Claude and retry."
+        if refreshing
+        else (
           "Claude rejected that authorization code. Start a new Claude "
           "connection and paste the newest code."
         )
+      )
       raise ProtocolError("provider_rejected", message, 502) from exc
     except httpx.TimeoutException as exc:
       raise ProtocolError("provider_timeout", "Claude login timed out.", 504) from exc
@@ -386,12 +407,18 @@ class ProviderAuth:
       CLAUDE_DIR / ".credentials.json", credentials, generation
     )
 
-  def invalidate_claude(self, generation: int) -> None:
+  def invalidate(self, provider: str, generation: int) -> None:
+    credential = {
+      "claude": CLAUDE_DIR / ".credentials.json",
+      "codex": CODEX_DIR / "auth.json",
+    }.get(provider)
+    if credential is None:
+      raise ValueError(f"Unsupported provider: {provider}")
     with self._state_lock:
       if not self._enabled or generation != self._generation:
         return
       try:
-        (CLAUDE_DIR / ".credentials.json").unlink()
+        credential.unlink()
       except FileNotFoundError:
         pass
 
@@ -414,7 +441,7 @@ class ProviderAuth:
       ):
         return
       if not self._claude_can_refresh(oauth):
-        self.invalidate_claude(generation)
+        self.invalidate("claude", generation)
         raise ProtocolError(
           "provider_auth_required",
           "Claude authorization expired. Reconnect Claude and retry.",
@@ -428,7 +455,7 @@ class ProviderAuth:
         }, refreshing=True)
       except ProtocolError as exc:
         if exc.code == "provider_rejected":
-          self.invalidate_claude(generation)
+          self.invalidate("claude", generation)
           raise ProtocolError(
             "provider_auth_required",
             "Claude authorization expired. Reconnect Claude and retry.",

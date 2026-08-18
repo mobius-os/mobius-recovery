@@ -305,7 +305,7 @@ async def _spawn(
     if proc.returncode not in {0, None}:
       detail = stderr.decode("utf-8", "replace").strip()[:1000]
       if "auth" in detail.lower() or "login" in detail.lower():
-        await asyncio.to_thread(provider_auth.invalidate_claude, generation)
+        await asyncio.to_thread(provider_auth.invalidate, provider, generation)
         detail = f"{provider.title()} authentication failed. Reconnect it and retry."
         yield {
           "type": "error", "code": "provider_auth_required", "message": detail,
