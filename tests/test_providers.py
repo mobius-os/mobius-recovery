@@ -224,6 +224,83 @@ def test_claude_refreshes_before_turn_and_persists_rotation(
   assert saved["organizationUuid"] == "org-preserved"
 
 
+@pytest.mark.parametrize(
+  ("status_code", "expected_code"),
+  [(429, "provider_rate_limited"), (503, "provider_unavailable")],
+)
+def test_transient_claude_refresh_failure_preserves_credentials(
+  tmp_path, monkeypatch, status_code, expected_code,
+) -> None:
+  claude_dir = tmp_path / "providers" / "claude"
+  monkeypatch.setattr(providers, "CLAUDE_DIR", claude_dir)
+  claude_dir.mkdir(parents=True)
+  credential = claude_dir / ".credentials.json"
+  original = {
+    "claudeAiOauth": {
+      "accessToken": "expired",
+      "refreshToken": "refresh-a",
+      "expiresAt": 0,
+    },
+  }
+  credential.write_text(json.dumps(original))
+  auth = ProviderAuth(claude_transport=httpx.MockTransport(
+    lambda _request: httpx.Response(status_code, json={"error": "temporary"})
+  ))
+
+  with pytest.raises(ProtocolError) as rejected:
+    auth.ensure_claude(auth.active_generation())
+
+  assert rejected.value.code == expected_code
+  assert json.loads(credential.read_text()) == original
+
+
+def test_rejected_claude_refresh_removes_unusable_credentials(
+  tmp_path, monkeypatch,
+) -> None:
+  claude_dir = tmp_path / "providers" / "claude"
+  monkeypatch.setattr(providers, "CLAUDE_DIR", claude_dir)
+  claude_dir.mkdir(parents=True)
+  credential = claude_dir / ".credentials.json"
+  credential.write_text(json.dumps({
+    "claudeAiOauth": {
+      "accessToken": "expired",
+      "refreshToken": "revoked",
+      "expiresAt": 0,
+    },
+  }))
+  auth = ProviderAuth(claude_transport=httpx.MockTransport(
+    lambda _request: httpx.Response(401, json={"error": "invalid_grant"})
+  ))
+
+  with pytest.raises(ProtocolError) as rejected:
+    auth.ensure_claude(auth.active_generation())
+
+  assert rejected.value.code == "provider_auth_required"
+  assert not credential.exists()
+
+
+def test_provider_invalidation_removes_only_the_failed_provider(
+  tmp_path, monkeypatch,
+) -> None:
+  claude_dir = tmp_path / "providers" / "claude"
+  codex_dir = tmp_path / "providers" / "codex"
+  monkeypatch.setattr(providers, "CLAUDE_DIR", claude_dir)
+  monkeypatch.setattr(providers, "CODEX_DIR", codex_dir)
+  claude_dir.mkdir(parents=True)
+  codex_dir.mkdir(parents=True)
+  claude_credential = claude_dir / ".credentials.json"
+  codex_credential = codex_dir / "auth.json"
+  claude_credential.write_text("{}")
+  codex_credential.write_text("{}")
+  auth = ProviderAuth()
+  generation = auth.active_generation()
+
+  auth.invalidate("codex", generation)
+
+  assert claude_credential.exists()
+  assert not codex_credential.exists()
+
+
 def test_replaced_session_generation_cannot_launch_provider_process() -> None:
   auth = ProviderAuth()
   stale_generation = auth.active_generation()

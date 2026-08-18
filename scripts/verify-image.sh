@@ -15,7 +15,16 @@ healthcheck=$(docker image inspect "$image" \
   --format '{{if .Config.Healthcheck}}present{{end}}')
 test -z "$healthcheck"
 
-docker run --rm --entrypoint /bin/sh "$image" -c '
+host_python=$(command -v python3 || command -v python)
+expected_claude=$("$host_python" -c \
+  'import json; print(json.load(open("package.json"))["dependencies"]["@anthropic-ai/claude-code"])')
+expected_codex=$("$host_python" -c \
+  'import json; print(json.load(open("package.json"))["dependencies"]["@openai/codex"])')
+
+docker run --rm \
+  -e EXPECTED_CLAUDE="$expected_claude" \
+  -e EXPECTED_CODEX="$expected_codex" \
+  --entrypoint /bin/sh "$image" -eu -c '
   test "$(id -u):$(id -g)" = "10001:10001"
   test ! -w /app
   test ! -w /app/recovery_worker/app.py
@@ -32,8 +41,8 @@ docker run --rm --entrypoint /bin/sh "$image" -c '
   ! command -v railway
   ! command -v node
   test ! -e /usr/local/lib/node_modules
-  claude --version | grep -F "2.1.223"
-  codex --version | grep -F "0.146.1"
+  test "$(claude --version)" = "$EXPECTED_CLAUDE (Claude Code)"
+  test "$(codex --version)" = "codex-cli $EXPECTED_CODEX"
   codex exec --help >/dev/null
   codex login --help >/dev/null
 '
@@ -156,7 +165,7 @@ while [ "$attempt" -lt 30 ]; do
     "import http.client,json; c=http.client.HTTPConnection('127.0.0.1',8000,timeout=2); c.request('GET','/health'); print(json.load(c.getresponse())['build_sha'])" \
     2>/dev/null); then
     test "$actual" = "$expected_sha"
-    docker exec "$container" /bin/sh -c '
+    docker exec "$container" /bin/sh -eu -c '
       ! test -r /proc/1/environ
       ! test -r /proc/1/mem
       ! test -r /proc/1/fd
