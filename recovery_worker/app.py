@@ -252,6 +252,7 @@ async def _sse_events(iterator, keepalive: float = SSE_KEEPALIVE_SECONDS):
   finally:
     if pending and not pending.done():
       pending.cancel()
+      await asyncio.gather(pending, return_exceptions=True)
     await iterator.aclose()
 
 
@@ -361,9 +362,7 @@ def create_app(
         body = launch_page(nonce, return_url=settings.control_plane_url)
     else:
       body = recovery_page(
-        nonce, protocol_version=WORKER_PROTOCOL_VERSION,
-        build_sha=settings.build_sha, session_id=session.session_id,
-        readiness_error=session.readiness_error,
+        nonce, readiness_error=session.readiness_error,
         finishing=session.finishing,
         idle_expires_at=session.exchange.idle_expires_at,
         expires_at=session.exchange.expires_at,
@@ -402,9 +401,7 @@ def create_app(
       LOGGER.exception("Recovery runtime setup failed after exchange")
       session.readiness_error = "The recovery worker could not prepare the target connection."
     body = recovery_page(
-      nonce, protocol_version=WORKER_PROTOCOL_VERSION,
-      build_sha=settings.build_sha, session_id=session.session_id,
-      readiness_error=session.readiness_error,
+      nonce, readiness_error=session.readiness_error,
       idle_expires_at=session.exchange.idle_expires_at,
       expires_at=session.exchange.expires_at,
       idle_timeout_seconds=session.exchange.idle_timeout_seconds,
@@ -488,7 +485,11 @@ def create_app(
     _, session = await current(request)
     return _security_headers(JSONResponse({
       "messages": [
-        {"role": message.role, "content": message.content}
+        {
+          "role": message.role,
+          "content": message.content,
+          **({"name": message.name} if message.role == "tool" else {}),
+        }
         for message in session.history()
       ]
     }))
@@ -497,7 +498,7 @@ def create_app(
   async def turn_status(request: Request):
     _, session = await current(request)
     return _security_headers(JSONResponse({
-      "active": turns.turn_active, "finishing": session.finishing,
+      **turns.snapshot(), "finishing": session.finishing,
       "idle_expires_at": session.exchange.idle_expires_at.isoformat(),
       "expires_at": session.exchange.expires_at.isoformat(),
       "idle_timeout_seconds": session.exchange.idle_timeout_seconds,

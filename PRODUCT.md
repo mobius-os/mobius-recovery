@@ -16,6 +16,8 @@ Möbius instance when its normal interface is unavailable.
 - Fail closed on expiry, replay, identity drift, redirects, or oversized data.
 - End inactive sessions after 20 minutes and every session within one hour;
   show both the automatic policy and the server-issued deadline in the UI.
+- Renew the idle deadline only for owner or agent work, never for a page visit
+  or a background readiness check.
 
 ## User flow
 
