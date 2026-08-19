@@ -28,6 +28,7 @@ MAX_STORED_MESSAGE_CHARS = 64_000
 class Message:
   role: str
   content: str
+  name: str = ""
 
 
 @dataclass
@@ -55,16 +56,23 @@ class RecoverySession:
     with self._revoke_lock:
       return self._revoked
 
-  def add_message(self, role: str, content: str) -> None:
+  def add_message(self, role: str, content: str, *, name: str = "") -> None:
     bounded = content[-MAX_STORED_MESSAGE_CHARS:]
+    bounded_name = name.strip()[:80]
     with self._revoke_lock:
       if self._revoked:
         return
       with self._messages_lock:
-        self.messages.append(Message(role=role, content=bounded))
+        self.messages.append(Message(
+          role=role, content=bounded, name=bounded_name,
+        ))
         self._history_chars += len(bounded)
         while len(self.messages) > MAX_HISTORY_MESSAGES or self._history_chars > MAX_HISTORY_CHARS:
           self._history_chars -= len(self.messages.pop(0).content)
+
+  def add_tool(self, name: str, detail: str) -> None:
+    """Keep visible tool chronology without feeding tool metadata to the model."""
+    self.add_message("tool", detail, name=name)
 
   def history(self, limit: int = MAX_HISTORY_MESSAGES) -> list[Message]:
     with self._messages_lock:

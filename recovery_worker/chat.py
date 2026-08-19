@@ -27,6 +27,8 @@ from .workspace import SessionWorkspaces
 MAX_MESSAGE_CHARS = 32_000
 MAX_TURN_SECONDS = 900
 MAX_CLI_OUTPUT_BYTES = 16 * 1024 * 1024
+MAX_TOOL_DETAIL_CHARS = 2_000
+MAX_TOOL_INPUT_BUFFER_CHARS = 8_000
 
 
 class TurnCoordinator:
@@ -36,17 +38,23 @@ class TurnCoordinator:
     self._lock = threading.Lock()
     self._running = False
     self._finishing = False
+    self._provider: str | None = None
+    self._started_at_ms: int | None = None
 
-  def claim_turn(self) -> bool:
+  def claim_turn(self, provider: str) -> bool:
     with self._lock:
       if self._running or self._finishing:
         return False
       self._running = True
+      self._provider = provider
+      self._started_at_ms = time.time_ns() // 1_000_000
       return True
 
   def release_turn(self) -> None:
     with self._lock:
       self._running = False
+      self._provider = None
+      self._started_at_ms = None
 
   def begin_finish(self) -> bool:
     """Prevent new turns before the active provider process is stopped."""
@@ -60,11 +68,16 @@ class TurnCoordinator:
     with self._lock:
       self._running = False
       self._finishing = False
+      self._provider = None
+      self._started_at_ms = None
 
-  @property
-  def turn_active(self) -> bool:
+  def snapshot(self) -> dict[str, bool | str | int | None]:
     with self._lock:
-      return self._running
+      return {
+        "active": self._running,
+        "provider": self._provider,
+        "started_at_ms": self._started_at_ms,
+      }
 
   @property
   def finishing(self) -> bool:
@@ -99,6 +112,8 @@ def _history(session: RecoverySession) -> str:
   lines: list[str] = []
   total = 0
   for message in reversed(session.history(40)):
+    if message.role not in {"user", "assistant"}:
+      continue
     block = f"{message.role.upper()}:\n{message.content}\n"
     total += len(block)
     if total > 100_000:
@@ -110,6 +125,133 @@ def _history(session: RecoverySession) -> str:
     + "\n".join(lines)
     + "\n\nRespond to the final USER message."
   )
+
+
+def _bounded_tool_text(value: object) -> str:
+  if value is None:
+    return ""
+  if isinstance(value, str):
+    text = value
+  elif isinstance(value, list) and all(isinstance(item, str) for item in value):
+    text = "\n".join(value)
+  else:
+    try:
+      text = json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+    except (TypeError, ValueError):
+      text = str(value)
+  text = "".join(
+    character for character in text
+    if character >= " " or character in "\n\t"
+  ).strip()
+  if len(text) > MAX_TOOL_DETAIL_CHARS:
+    return text[:MAX_TOOL_DETAIL_CHARS - 1].rstrip() + "…"
+  return text
+
+
+def _tool_detail(value: object) -> str:
+  """Return the useful, bounded part of a provider tool input."""
+  if isinstance(value, dict):
+    for key in (
+      "command", "cmd", "file_path", "path", "pattern", "query",
+      "description",
+    ):
+      if value.get(key):
+        return _bounded_tool_text(value[key])
+  return _bounded_tool_text(value)
+
+
+def _provider_events(
+  provider: str,
+  event: dict,
+  pending_tools: dict[int, dict],
+) -> list[dict]:
+  """Normalize provider JSONL while retaining complete tool input summaries."""
+  normalized: list[dict] = []
+  if provider == "claude":
+    if event.get("type") == "result" and event.get("is_error"):
+      return [{
+        "type": "error",
+        "message": str(event.get("result", "Provider error"))[:1000],
+      }]
+    if event.get("type") != "stream_event":
+      return normalized
+    inner = event.get("event") or {}
+    index = inner.get("index")
+    if not isinstance(index, int):
+      index = -1
+    if inner.get("type") == "content_block_start":
+      block = inner.get("content_block") or {}
+      if block.get("type") == "tool_use":
+        pending_tools[index] = {
+          "name": str(block.get("name") or "Tool")[:80],
+          "input": block.get("input"),
+          "partial": "",
+        }
+    elif inner.get("type") == "content_block_delta":
+      delta = inner.get("delta") or {}
+      if delta.get("type") == "text_delta" and delta.get("text"):
+        normalized.append({"type": "text", "content": str(delta["text"])})
+      elif delta.get("type") == "input_json_delta" and index in pending_tools:
+        partial = str(delta.get("partial_json") or "")
+        current = pending_tools[index]["partial"]
+        pending_tools[index]["partial"] = (
+          current + partial
+        )[:MAX_TOOL_INPUT_BUFFER_CHARS]
+    elif inner.get("type") == "content_block_stop":
+      tool = pending_tools.pop(index, None)
+      if tool:
+        value = tool["input"]
+        if tool["partial"]:
+          try:
+            value = json.loads(tool["partial"])
+          except json.JSONDecodeError:
+            value = tool["partial"]
+        normalized.append({
+          "type": "tool",
+          "name": tool["name"],
+          "detail": _tool_detail(value),
+        })
+    return normalized
+
+  if event.get("type") != "item.completed":
+    return normalized
+  item = event.get("item") or {}
+  item_type = item.get("type")
+  if item_type == "agent_message" and item.get("text"):
+    normalized.append({"type": "text", "content": str(item["text"])})
+  elif item_type in {"tool_use", "command_execution", "commandExecution"}:
+    is_command = item_type in {"command_execution", "commandExecution"}
+    normalized.append({
+      "type": "tool",
+      "name": str(item.get("name") or ("Command" if is_command else "Tool"))[:80],
+      "detail": _tool_detail(item.get("command") or item.get("input")),
+    })
+  return normalized
+
+
+def _record_provider_event(
+  session: RecoverySession,
+  event: dict,
+  assistant_segment: list[str],
+) -> None:
+  """Persist the visible stream as ordered prose and tool records."""
+  if event["type"] == "text":
+    assistant_segment.append(event["content"])
+    return
+  if event["type"] != "tool":
+    return
+  _flush_assistant(session, assistant_segment)
+  session.add_tool(event["name"], event["detail"])
+
+
+def _flush_assistant(
+  session: RecoverySession,
+  assistant_segment: list[str],
+) -> None:
+  text = "".join(assistant_segment).strip()
+  if text:
+    session.add_message("assistant", text)
+  assistant_segment.clear()
 
 
 def _kill_group(proc: asyncio.subprocess.Process, sig: int) -> None:
@@ -244,7 +386,8 @@ async def _spawn(
     yield {"type": "error", "message": f"{provider} CLI could not start."}
     return
   stderr_task = asyncio.create_task(_stderr(proc))
-  assistant: list[str] = []
+  assistant_segment: list[str] = []
+  pending_tools: dict[int, dict] = {}
   output_size = 0
   timed_out = False
   deadline = time.monotonic() + MAX_TURN_SECONDS
@@ -274,29 +417,9 @@ async def _spawn(
         event = json.loads(line.decode("utf-8"))
       except (UnicodeDecodeError, json.JSONDecodeError):
         continue
-      if provider == "claude":
-        if event.get("type") == "stream_event":
-          inner = event.get("event") or {}
-          if inner.get("type") == "content_block_delta":
-            delta = inner.get("delta") or {}
-            if delta.get("type") == "text_delta" and delta.get("text"):
-              text = str(delta["text"])
-              assistant.append(text)
-              yield {"type": "text", "content": text}
-          elif inner.get("type") == "content_block_start":
-            block = inner.get("content_block") or {}
-            if block.get("type") == "tool_use":
-              yield {"type": "tool", "name": str(block.get("name", "tool"))[:80]}
-        elif event.get("type") == "result" and event.get("is_error"):
-          yield {"type": "error", "message": str(event.get("result", "Provider error"))[:1000]}
-      elif event.get("type") == "item.completed":
-        item = event.get("item") or {}
-        if item.get("type") == "agent_message" and item.get("text"):
-          text = str(item["text"])
-          assistant.append(text)
-          yield {"type": "text", "content": text}
-        elif item.get("type") in {"tool_use", "command_execution", "commandExecution"}:
-          yield {"type": "tool", "name": str(item.get("name") or item.get("command") or "tool")[:80]}
+      for normalized in _provider_events(provider, event, pending_tools):
+        _record_provider_event(session, normalized, assistant_segment)
+        yield normalized
     if timed_out:
       yield {"type": "error", "message": "Recovery turn timed out after 15 minutes."}
     if proc.returncode is None:
@@ -305,7 +428,7 @@ async def _spawn(
     if proc.returncode not in {0, None}:
       detail = stderr.decode("utf-8", "replace").strip()[:1000]
       if "auth" in detail.lower() or "login" in detail.lower():
-        await asyncio.to_thread(provider_auth.invalidate_claude, generation)
+        await asyncio.to_thread(provider_auth.invalidate, provider, generation)
         detail = f"{provider.title()} authentication failed. Reconnect it and retry."
         yield {
           "type": "error", "code": "provider_auth_required", "message": detail,
@@ -313,12 +436,11 @@ async def _spawn(
       else:
         yield {"type": "error", "message": detail or f"{provider} exited unexpectedly."}
   finally:
+    _flush_assistant(session, assistant_segment)
     await _terminate(proc)
     if not stderr_task.done():
       stderr_task.cancel()
-  text = "".join(assistant).strip()
-  if text:
-    session.add_message("assistant", text)
+    await asyncio.gather(stderr_task, return_exceptions=True)
 
 
 async def stream_turn(
@@ -337,7 +459,7 @@ async def stream_turn(
     yield {"type": "error", "message": "Message must be 1–32,000 characters."}
     yield {"type": "done"}
     return
-  if not turns.claim_turn():
+  if not turns.claim_turn(provider):
     yield {"type": "error", "message": "Another recovery turn is running."}
     yield {"type": "done"}
     return
