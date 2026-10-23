@@ -12,10 +12,11 @@ is reserved for actual errors and destructive cancellation.
 ## Composition
 
 The desktop surface is a sidebar (brand, target status, session clock, provider
-rows, End recovery) beside the conversation, the same arrangement as the shell's
-drawer and chat. On narrow screens the sidebar becomes the opening section and
-the conversation follows in normal document flow with the composer pinned to
-the bottom. Hairline borders define regions; shadows are reserved for dialogs.
+rows, End recovery) beside a headerless conversation, the same arrangement as
+the shell's drawer and chat. On narrow screens the sidebar becomes a compact
+opening section with End recovery beside the brand, and the conversation
+follows with the composer pinned to the bottom. Hairline borders define
+regions; shadows are reserved for dialogs.
 
 ## Typography
 
@@ -45,8 +46,12 @@ Controls have explicit hover, focus, disabled, loading, success, and error
 states. Streaming output appears in place without entrance choreography.
 Authored motion is limited to the target-status pulse, the activity spinner,
 and the working-label sweep; all are disabled under `prefers-reduced-motion`.
-Remote commands appear as compact "Ran a command on Möbius" rows that expand to
-the full command, like the shell's activity rows.
+The transcript reads like a Möbius chat. Consecutive tool calls collapse into one
+activity line worded exactly as the shell words it ("Running a command ·
+Reading files" while live, "Ran commands, read a file" once settled), with the
+shell's type glyph, and expand to a quiet timeline of raw tool names and what
+they ran. Assistant replies render the Markdown subset agents write
+(paragraphs, headings, lists, code, bold), built from text nodes only.
 
 Finish freezes the incident workspace immediately. A managed live target is
 shown as closed only after its signed session revocation is confirmed; failure
