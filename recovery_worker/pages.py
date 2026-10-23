@@ -1,15 +1,15 @@
 """Recovery's dependency-free incident interface.
 
-THESIS: privilege is visibly elsewhere; this worker is a calm window into one
-fixed target, never a red emergency dashboard or a grid of admin cards.
-OWN-WORLD: near-black planes, one violet action, crisp region borders, native UI
-type, and monospace only for protocol facts.
+THESIS: Recovery is Möbius working from outside itself, so it wears the same
+skin as the shell: the same near-black theme tokens, Inter, the Möbius mark,
+quiet sidebar rows, plain assistant prose, accent user bubbles, compact activity
+rows, and the rounded composer pill.
+SCOPE: privilege is still visibly elsewhere; the sidebar names the one fixed
+target, the session clock, and the provider, and nothing else.
 STORY: authenticate, confirm isolation and target state, connect one provider,
 repair conversationally, verify, then deliberately finish.
-FIRST VIEWPORT: context rail at left, active recovery transcript at right, with
-the composer anchored to the working edge.
-FORM: focused two-pane operator workspace, derived directly from the required
-incident sequence; no open staging choice or concept seed was needed.
+ZERO REQUESTS ELSEWHERE: fonts and the mark are baked into the image and served
+from this worker's own origin; nothing is fetched from another host.
 """
 
 from __future__ import annotations
@@ -17,165 +17,241 @@ from __future__ import annotations
 import html
 import json
 from datetime import datetime
+from pathlib import Path
+
+
+_ASSET_DIR = Path(__file__).with_name("assets")
+_ASSET_TYPES = {
+  "inter-400.woff2": "font/woff2",
+  "inter-500.woff2": "font/woff2",
+  "inter-600.woff2": "font/woff2",
+  "jetbrains-mono-400.woff2": "font/woff2",
+  "mobius-mark.png": "image/png",
+}
+# Read once at import: the set is fixed and served by name, never by path.
+ASSETS: dict[str, tuple[bytes, str]] = {
+  name: ((_ASSET_DIR / name).read_bytes(), media_type)
+  for name, media_type in _ASSET_TYPES.items()
+}
 
 
 def _brand_mark(class_name: str = "mark") -> str:
-  """The inline Möbius loop used by the core product's zero-request surfaces."""
-  return f'''<svg class="{html.escape(class_name)}" viewBox="0 0 24 24" fill="none" aria-hidden="true">
-<path d="M4 12c0-3.2 3-5 6.2-3.4C13 10 11 14 13.8 15.4 17 17 20 15.2 20 12s-3-5-6.2-3.4C11 10 13 14 10.2 15.4 7 17 4 15.2 4 12Z" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg>'''
+  """The Möbius mark the shell shows beside its wordmark."""
+  return (
+    f'<img class="{html.escape(class_name)}" src="/assets/mobius-mark.png" '
+    'alt="" width="28" height="28">'
+  )
 
 
-_STYLE = """
+_LATIN = (
+  "U+0000-00FF, U+0131, U+0152-0153, U+02BB-02BC, U+02C6, U+02DA, U+02DC, "
+  "U+0300-036F, U+0370-0377, U+037A-037F, U+0384-038A, U+038C, U+038E-03A1, U+03A3-03FF"
+)
+
+
+def _face(family: str, weight: int, file: str) -> str:
+  return (
+    f"@font-face {{ font-family: '{family}'; font-style: normal; font-weight: {weight}; "
+    f"font-display: swap; src: url('/assets/{file}') format('woff2'); unicode-range: {_LATIN}; }}\n"
+  )
+
+
+# Same faces and metric-matched fallbacks as the shell's mobius-fonts.css.
+_FONTS = (
+  "@font-face { font-family: 'Inter Fallback'; src: local('Arial'); size-adjust: 107.6%; "
+  "ascent-override: 90.1%; descent-override: 22.4%; line-gap-override: 0%; }\n"
+  "@font-face { font-family: 'JetBrains Mono Fallback'; src: local('Menlo'), local('Consolas'), "
+  "local('DejaVu Sans Mono'); size-adjust: 99.7%; ascent-override: 102.3%; "
+  "descent-override: 30.1%; line-gap-override: 0%; }\n"
+  + _face("Inter", 400, "inter-400.woff2")
+  + _face("Inter", 500, "inter-500.woff2")
+  + _face("Inter", 600, "inter-600.woff2")
+  + _face("JetBrains Mono", 400, "jetbrains-mono-400.woff2")
+)
+
+
+_STYLE = _FONTS + """
 :root {
   color-scheme: dark;
-  --canvas: #08080a;
-  --rail: #0e0e11;
-  --raised: #141419;
-  --raised-hover: #1b1b21;
-  --text: #f4f2f7;
-  --muted: #a8a4b0;
-  --faint: #8f8a99;
-  --border: rgba(255, 255, 255, .11);
-  --hairline: rgba(255, 255, 255, .07);
-  --accent: #9b82ff;
-  --accent-hover: #b3a0ff;
-  --accent-dim: rgba(155, 130, 255, .14);
-  --success: #34d399;
-  --warning: #f2c879;
-  --danger: #fb7185;
-  --focus: #b3a0ff;
-  --shadow: inset 0 1px 0 rgba(255,255,255,.06), 0 18px 48px -24px rgba(0,0,0,.9);
+  --font: 'Inter', 'Inter Fallback', system-ui, -apple-system, sans-serif;
+  --mono: 'JetBrains Mono', 'JetBrains Mono Fallback', ui-monospace, 'SF Mono', monospace;
+  /* The shell's default dark theme tokens. */
+  --bg: #0d0d0d;
+  --surface: #171717;
+  --surface-2: #212121;
+  --border: #2a2a2a;
+  --border-light: #1f1f1f;
+  --text: #ececec;
+  --muted: #a8a8a8;
+  --accent: #8b6cf7;
+  --accent-hover: #7c5ce6;
+  --accent-dim: rgba(139, 108, 247, .14);
+  --accent-fg: #ffffff;
+  --danger: #f87171;
+  --green: #10b981;
+  --warning: #fbbf24;
 }
-* { box-sizing: border-box; }
-html, body { min-height: 100%; margin: 0; background: var(--canvas); }
+* { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+html, body { min-height: 100%; margin: 0; background: var(--bg); }
 html { scrollbar-color: var(--border) transparent; }
 body {
   min-height: 100vh;
   color: var(--text);
-  font: 15px/1.5 ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+  font: 15px/1.6 var(--font);
   -webkit-font-smoothing: antialiased;
-  -webkit-tap-highlight-color: transparent;
 }
-::selection { background: var(--accent); color: #100d18; }
-button, input, textarea { font: inherit; }
+::selection { background: rgba(139, 108, 247, .35); }
+button, input, textarea { font: inherit; color: inherit; }
 button { cursor: pointer; }
-a { color: var(--focus); text-underline-offset: 3px; }
-:focus-visible { outline: 2px solid var(--focus); outline-offset: 3px; }
+a { color: var(--accent); text-underline-offset: 3px; }
+:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
 h1, h2, p { margin-top: 0; }
-h1 { margin-bottom: 14px; font-size: clamp(2rem, 7vw, 3.3rem); line-height: 1.03; letter-spacing: -.025em; }
-h2 { margin-bottom: 10px; font-size: 1rem; letter-spacing: -.015em; }
+h1 { margin-bottom: 10px; font-size: 28px; font-weight: 600; line-height: 1.25; letter-spacing: -.01em; }
+h2 { margin-bottom: 8px; font-size: 15px; font-weight: 600; }
 .start { display: grid; min-height: 100vh; place-items: center; padding: 24px; }
-.start-main { width: min(100%, 460px); }
-.mark { display: block; flex: none; width: 34px; height: 34px; color: var(--accent); }
-.start-main > .mark { width: 46px; height: 46px; margin-bottom: 28px; }
-.lede { max-width: 68ch; margin-bottom: 28px; color: var(--muted); line-height: 1.65; }
-label { display: block; margin-bottom: 8px; font-size: .84rem; font-weight: 650; }
+.start-main { width: min(100%, 440px); }
+.mark { display: block; flex: none; width: 28px; height: 28px; border-radius: 6px; }
+.start-main > .mark { width: 48px; height: 48px; margin-bottom: 24px; border-radius: 11px; }
+.lede { max-width: 64ch; margin-bottom: 24px; color: var(--muted); line-height: 1.6; }
+label { display: block; margin-bottom: 8px; font-size: 13px; font-weight: 500; }
 .input {
-  width: 100%; padding: 13px 14px; border: 1px solid var(--border); border-radius: 12px;
-  background: var(--raised); color: var(--text); caret-color: var(--accent);
+  width: 100%; padding: 11px 14px; border: 1px solid var(--border); border-radius: 12px;
+  background: var(--surface); color: var(--text); caret-color: var(--accent);
 }
+.input:focus { border-color: var(--accent); outline: 0; }
 .button {
-  display: inline-flex; min-height: 44px; align-items: center; justify-content: center;
-  padding: 11px 15px; border: 0; border-radius: 12px;
-  background: var(--accent); color: #100d18; font-weight: 720;
+  display: inline-flex; min-height: 40px; align-items: center; justify-content: center; gap: 8px;
+  padding: 8px 16px; border: 1px solid transparent; border-radius: 10px;
+  background: var(--accent); color: var(--accent-fg); font-weight: 500; text-decoration: none;
+  transition: background-color .12s;
 }
 .button:not(:disabled):hover { background: var(--accent-hover); }
 .button:disabled { cursor: not-allowed; opacity: .5; }
-.button.secondary { border: 1px solid var(--border); background: var(--raised); color: var(--text); }
-.button.secondary:not(:disabled):hover { background: var(--raised-hover); }
-.button.compact { padding: 8px 11px; font-size: .78rem; }
-.error { padding: 12px 14px; border: 1px solid rgba(251,113,133,.35); border-radius: 12px; background: rgba(251,113,133,.12); color: #ffd7de; line-height: 1.5; }
+.button.secondary { border-color: var(--border); background: var(--surface); color: var(--text); }
+.button.secondary:not(:disabled):hover { background: var(--surface-2); }
+.button.compact { min-height: 32px; padding: 5px 12px; font-size: 13px; }
+.error { padding: 10px 14px; border: 1px solid rgba(248,113,113,.3); border-radius: 12px; background: rgba(248,113,113,.1); color: #fecaca; line-height: 1.5; }
 .stack { display: grid; gap: 12px; }
-.shell { display: grid; min-height: 100vh; grid-template-columns: 296px minmax(0, 1fr); }
+.shell { display: grid; min-height: 100vh; grid-template-columns: 320px minmax(0, 1fr); }
 .rail {
-  display: flex; min-width: 0; flex-direction: column; gap: 24px; padding: 22px;
-  border-inline-end: 1px solid var(--border); background: var(--rail);
+  display: flex; min-width: 0; flex-direction: column; gap: 20px; padding: 14px 12px 16px;
+  border-inline-end: 1px solid var(--border-light); background: var(--bg);
 }
-.brand { display: flex; align-items: center; gap: 10px; font-weight: 720; letter-spacing: -.015em; }
-.status-line { display: flex; align-items: flex-start; gap: 10px; color: var(--muted); font-size: .86rem; line-height: 1.45; }
-.status-line strong { color: var(--text); font-weight: 650; }
-.dot { flex: none; width: 8px; height: 8px; margin-top: 6px; border-radius: 50%; background: var(--success); }
+.brand { display: flex; align-items: center; gap: 10px; min-height: 40px; padding: 0 8px; }
+.wordmark { font-size: 20px; font-weight: 600; }
+.brand-tag { padding: 2px 8px; border-radius: 999px; background: var(--accent-dim); color: var(--accent); font-size: 12px; font-weight: 500; }
+.status-line { display: flex; align-items: flex-start; gap: 10px; padding: 0 12px; color: var(--muted); font-size: 13px; line-height: 1.5; }
+.status-line strong { color: var(--text); font-size: 15px; font-weight: 500; }
+.dot { flex: none; width: 8px; height: 8px; margin-top: 8px; border-radius: 50%; background: var(--green); }
 .dot.pending { background: var(--accent); animation: pulse 1.8s ease-out infinite; }
 .dot.error-dot { background: var(--danger); animation: none; }
-.session-life { padding-block: 18px; border-block: 1px solid var(--border); }
+.session-life { margin: 0 4px; padding: 12px 14px; border: 1px solid var(--border-light); border-radius: 12px; background: rgba(23,23,23,.6); }
 .session-life-head { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; }
 .session-life h2 { margin: 0; }
-.countdown { font-variant-numeric: tabular-nums; font-size: 1.05rem; font-weight: 700; }
-.session-life p { margin: 7px 0 13px; color: var(--muted); font-size: .8rem; line-height: 1.5; }
+.countdown { font-variant-numeric: tabular-nums; font-size: 15px; font-weight: 600; }
+.session-life p { margin: 4px 0 12px; color: var(--muted); font-size: 13px; line-height: 1.5; }
+.session-life.warning { border-color: rgba(251,191,36,.35); }
 .session-life.warning .countdown { color: var(--warning); }
-.providers { display: grid; gap: 5px; }
-.provider { display: flex; min-width: 0; align-items: center; justify-content: space-between; gap: 10px; padding: 8px 0; }
-.provider-name { display: flex; min-height: 44px; align-items: center; gap: 9px; margin: 0; }
-.provider input { accent-color: var(--accent); }
-.link-button { min-height: 44px; padding: 8px; border: 0; background: none; color: var(--focus); font-size: .8rem; }
-.link-button:disabled { color: var(--faint); cursor: default; }
-.rail-end { display: grid; gap: 9px; margin-top: auto; }
-.rail-end p { margin: 0; color: var(--faint); font-size: .75rem; line-height: 1.45; }
-.workspace { display: grid; min-width: 0; height: 100vh; grid-template-rows: auto minmax(0, 1fr) auto; }
-.workspace-head { display: flex; align-items: center; justify-content: space-between; gap: 16px; padding: 18px 28px; border-bottom: 1px solid var(--border); }
-.workspace-head p { margin: 3px 0 0; color: var(--muted); font-size: .82rem; }
+.section-title { margin: 0 0 4px; padding: 0 12px; }
+.providers { display: grid; gap: 2px; }
+.provider {
+  display: flex; min-width: 0; min-height: 40px; align-items: center; justify-content: space-between; gap: 8px;
+  padding: 0 4px 0 12px; border-radius: 10px; transition: background-color .12s;
+}
+.provider:has(input:checked) { background: var(--accent-dim); }
+.provider:has(input:checked) .provider-name { color: var(--accent); }
+.provider-name { display: flex; min-height: 40px; flex: 1; align-items: center; gap: 10px; margin: 0; font-size: 15px; font-weight: 400; cursor: pointer; }
+.provider input { margin: 0; accent-color: var(--accent); }
+.link-button { min-height: 32px; padding: 4px 8px; border: 0; border-radius: 8px; background: none; color: var(--accent); font-size: 13px; }
+.link-button:not(:disabled):hover { background: var(--surface); }
+.link-button:disabled { color: var(--muted); cursor: default; }
+.rail-end { display: grid; gap: 10px; margin-top: auto; padding: 14px 4px 0; border-top: 1px solid var(--border-light); }
+.rail-end p { margin: 0; padding: 0 8px; color: var(--muted); font-size: 13px; line-height: 1.5; }
+.workspace { display: grid; min-width: 0; height: 100vh; grid-template-columns: minmax(0, 1fr); grid-template-rows: auto minmax(0, 1fr) auto; }
+.workspace-head { display: flex; min-height: 58px; align-items: center; justify-content: space-between; gap: 16px; padding: 10px 24px; border-bottom: 1px solid var(--border-light); }
+.workspace-head strong { font-weight: 600; }
+.workspace-head p { margin: 1px 0 0; color: var(--muted); font-size: 13px; }
 .mobile-end { display: none; }
-.messages { overflow: auto; padding: 34px max(24px, calc((100% - 760px) / 2)); }
-.empty { max-width: 630px; margin: 11vh auto 0; }
-.empty h1 { max-width: 13ch; font-size: clamp(2.4rem, 5vw, 4.5rem); text-wrap: balance; }
-.empty p { max-width: 58ch; }
-.empty-note { display: flex; max-width: 60ch; gap: 10px; margin-top: 24px; color: var(--faint); font-size: .8rem; }
+.messages { overflow: auto; padding: 28px max(20px, calc((100% - 720px) / 2)); }
+.empty { max-width: 600px; margin: 14vh auto 0; text-align: center; }
+.empty .lede { margin-inline: auto; }
+.empty-note { display: flex; max-width: 52ch; gap: 8px; margin: 0 auto; color: var(--muted); font-size: 13px; text-align: start; }
 .empty-note svg { flex: none; width: 16px; height: 16px; margin-top: 2px; }
-.message { max-width: 720px; margin: 0 auto 26px; overflow-wrap: anywhere; line-height: 1.65; white-space: pre-wrap; }
-.message.user { padding: 14px 16px; border-radius: 14px; background: var(--raised); box-shadow: inset 0 1px 0 rgba(255,255,255,.04); }
-.message.error-message { color: #ffd7de; }
-.message-label { display: block; margin-bottom: 6px; color: var(--faint); font-size: .7rem; font-weight: 700; letter-spacing: .03em; }
-.tool, .agent-activity { max-width: 720px; margin: 0 auto 14px; color: var(--muted); font-size: .82rem; }
-.tool { display: grid; gap: 7px; padding: 11px 13px; border: 1px solid var(--hairline); border-inline-start: 2px solid var(--accent); border-radius: 10px; background: rgba(255,255,255,.025); }
-.tool-label { color: var(--faint); font-size: .68rem; font-weight: 700; letter-spacing: .045em; text-transform: uppercase; }
-.tool-detail { margin: 0; overflow-wrap: anywhere; color: var(--text); font: .76rem/1.55 ui-monospace, SFMono-Regular, Menlo, monospace; white-space: pre-wrap; }
-.agent-activity { display: flex; align-items: flex-start; gap: 10px; padding: 2px 0 10px 4px; }
-.spinner { flex: none; width: 10px; height: 10px; margin-top: 5px; border: 1.5px solid var(--border); border-top-color: var(--accent); border-radius: 50%; animation: spin .75s linear infinite; }
-.agent-activity strong { position: relative; display: inline-block; color: var(--muted); font-weight: 500; }
+.message { margin: 0 0 16px; overflow-wrap: anywhere; line-height: 1.7; white-space: pre-wrap; }
+.message.assistant { padding: 0 8px; }
+.message.user {
+  width: fit-content; max-width: min(85%, 640px); margin-left: auto; padding: 11px 16px;
+  border-radius: 18px 18px 5px 18px; color: #fff;
+  background: linear-gradient(135deg, var(--accent), color-mix(in srgb, var(--accent) 78%, #000));
+  box-shadow: 0 2px 14px -4px var(--accent-dim);
+}
+.message.error-message { color: #fecaca; }
+.tool { margin: 0 0 8px; padding-left: 6px; color: var(--muted); font-size: 13px; }
+.tool > summary { display: flex; min-width: 0; align-items: center; gap: 8px; width: fit-content; max-width: 100%; padding: 2px 0; list-style: none; cursor: pointer; }
+.tool > summary::-webkit-details-marker { display: none; }
+.tool > summary:hover { color: var(--text); }
+.tool > summary svg { flex: none; width: 14px; height: 14px; }
+.tool-label { flex: none; }
+.tool-preview { min-width: 0; overflow: hidden; color: var(--muted); font: 12px var(--mono); text-overflow: ellipsis; white-space: nowrap; opacity: .8; }
+.tool[open] .tool-preview { display: none; }
+.tool-detail { margin: 6px 0 4px; padding: 10px 12px; overflow: auto; max-height: 320px; border: 1px solid var(--border-light); border-radius: 10px; background: var(--surface); color: var(--text); font: 12px/1.55 var(--mono); white-space: pre-wrap; overflow-wrap: anywhere; }
+.agent-activity { display: flex; align-items: flex-start; gap: 8px; margin: 0 0 12px; padding-left: 6px; color: var(--muted); font-size: 13px; }
+.spinner { flex: none; width: 12px; height: 12px; margin-top: 4px; border: 1.5px solid var(--border); border-top-color: var(--accent); border-radius: 50%; animation: spin .75s linear infinite; }
+.agent-activity strong { position: relative; display: inline-block; color: var(--muted); font-weight: 400; }
 .agent-activity strong::after { content: attr(data-label); position: absolute; inset: 0; overflow: hidden; color: var(--text); white-space: nowrap; -webkit-mask: linear-gradient(90deg, transparent, #000 35%, transparent 70%) 120% 0 / 300% 100% no-repeat; mask: linear-gradient(90deg, transparent, #000 35%, transparent 70%) 120% 0 / 300% 100% no-repeat; animation: sweep 2.4s steps(48,end) infinite; }
-.agent-activity small { display: block; margin-top: 2px; color: var(--faint); font-variant-numeric: tabular-nums; }
-.composer-wrap { padding: 16px max(18px, calc((100% - 810px) / 2)) max(22px, env(safe-area-inset-bottom)); background: linear-gradient(transparent, var(--canvas) 24%); }
-.composer { padding: 11px; border: 1px solid var(--border); border-radius: 16px; background: var(--raised); box-shadow: var(--shadow); }
-textarea { display: block; width: 100%; min-height: 72px; max-height: 220px; padding: 5px 6px 10px; resize: vertical; border: 0; background: transparent; color: var(--text); caret-color: var(--accent); line-height: 1.5; }
-textarea::placeholder { color: var(--faint); opacity: 1; }
+.agent-activity small { display: block; margin-top: 1px; color: var(--muted); font-size: 12px; font-variant-numeric: tabular-nums; opacity: .8; }
+.composer-wrap { padding: 12px max(16px, calc((100% - 760px) / 2)) max(20px, env(safe-area-inset-bottom)); background: linear-gradient(transparent, var(--bg) 30%); }
+.composer {
+  display: flex; align-items: flex-end; gap: 6px; padding: 4px;
+  border: 1px solid var(--border-light); border-radius: 24px; background: rgba(23,23,23,.6);
+  transition: border-color .12s;
+}
+.composer:focus-within { border-color: var(--border); }
+textarea { display: block; flex: 1; min-width: 0; height: 40px; min-height: 40px; max-height: 200px; padding: 8px 8px 8px 14px; resize: none; border: 0; background: transparent; color: var(--text); caret-color: var(--accent); font-size: 16px; line-height: 1.45; }
+textarea::placeholder { color: var(--muted); opacity: 1; }
 textarea:focus { outline: 0; }
-.composer-foot { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
-.hint { color: var(--faint); font-size: .74rem; }
-.inline-error { max-width: 720px; margin: 0 auto 14px; padding: 10px 12px; border-radius: 12px; background: rgba(251,113,133,.12); color: #ffd7de; font-size: .84rem; }
-dialog { width: min(calc(100% - 32px), 500px); padding: 22px; border: 1px solid var(--border); border-radius: 16px; background: var(--rail); color: var(--text); box-shadow: 0 24px 64px -18px #000; }
-dialog::backdrop { background: rgba(5,5,6,.84); }
-.dialog-actions { display: flex; justify-content: flex-end; gap: 10px; margin-top: 20px; }
-.code { padding: 16px; border-radius: 12px; background: var(--canvas); font: 700 1.5rem ui-monospace,SFMono-Regular,monospace; letter-spacing: .06em; text-align: center; user-select: all; }
+.send { display: grid; flex: none; width: 40px; height: 40px; place-items: center; padding: 0; border: 0; border-radius: 50%; background: var(--accent); color: var(--accent-fg); transition: background-color .12s, opacity .12s; }
+.send:not(:disabled):hover { background: var(--accent-hover); }
+.send:disabled { cursor: not-allowed; opacity: .4; }
+.send svg { width: 18px; height: 18px; }
+.send .spinner { display: none; margin: 0; border-color: rgba(255,255,255,.35); border-top-color: #fff; }
+.send.working { opacity: 1; }
+.send.working svg { display: none; }
+.send.working .spinner { display: block; }
+.inline-error { margin: 0 0 12px; padding: 10px 12px; border-radius: 12px; background: rgba(248,113,113,.1); color: #fecaca; font-size: 13px; }
+dialog { width: min(calc(100% - 32px), 460px); padding: 20px; border: 1px solid var(--border); border-radius: 16px; background: var(--surface); color: var(--text); box-shadow: 0 24px 64px -18px #000; }
+dialog::backdrop { background: rgba(0,0,0,.6); }
+dialog .lede { margin-bottom: 0; }
+.dialog-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 20px; }
+.code { padding: 14px; border-radius: 12px; background: var(--bg); font: 500 1.4rem var(--mono); letter-spacing: .06em; text-align: center; user-select: all; }
 .sr { position: absolute; width: 1px; height: 1px; margin: -1px; padding: 0; overflow: hidden; clip: rect(0,0,0,0); border: 0; white-space: nowrap; }
 @keyframes pulse { 50% { opacity: .45; } }
 @keyframes spin { to { transform: rotate(360deg); } }
 @keyframes sweep { 0% { -webkit-mask-position: 120% 0; mask-position: 120% 0; } 42%, 100% { -webkit-mask-position: -50% 0; mask-position: -50% 0; } }
 @media (prefers-reduced-motion: reduce) {
-  *, *::before, *::after { animation-duration: 1ms !important; animation-iteration-count: 1 !important; scroll-behavior: auto !important; }
+  *, *::before, *::after { animation-duration: 1ms !important; animation-iteration-count: 1 !important; scroll-behavior: auto !important; transition: none !important; }
   .spinner { border-color: var(--accent); opacity: .65; }
   .agent-activity strong::after { display: none; }
 }
 @media (forced-colors: active) {
   .dot, .spinner { forced-color-adjust: none; }
-  .button, .input, .composer, dialog { border: 1px solid ButtonText; }
+  .button, .input, .composer, .send, dialog { border: 1px solid ButtonText; }
 }
 @media (max-width: 760px) {
   .shell { display: block; }
-  .rail { gap: 14px; padding: 16px 18px; border-inline-end: 0; border-bottom: 1px solid var(--border); }
-  .session-life { padding-block: 14px; }
-  .session-life p { margin: 5px 0 9px; font-size: .75rem; }
-  .provider { padding: 5px 0; }
+  .rail { gap: 12px; padding: 10px 8px 12px; border-inline-end: 0; border-bottom: 1px solid var(--border-light); }
+  .session-life { padding: 10px 12px; }
+  .session-life p { margin: 2px 0 8px; font-size: 12px; }
   .rail-end { display: none; }
   .workspace { min-height: 76vh; height: auto; grid-template-rows: auto auto auto; }
-  .workspace-head { padding: 16px 18px; }
+  .workspace-head { padding: 10px 16px; }
   .mobile-end { display: block; }
-  .messages { min-height: 300px; overflow: visible; padding: 24px 18px; }
-  .messages > * { scroll-margin-bottom: 220px; }
+  .messages { min-height: 280px; overflow: visible; padding: 20px 14px; }
+  .messages > * { scroll-margin-bottom: 140px; }
   .empty { margin: 4vh 0; }
-  .empty h1 { max-width: none; font-size: clamp(1.75rem, 8.5vw, 2rem); white-space: nowrap; }
+  .empty h1 { font-size: 22px; }
   .empty .lede, .empty-note { display: none; }
-  .composer-wrap { position: sticky; bottom: 0; z-index: 3; padding: 12px; background: rgba(8,8,10,.96); }
-  .hint { max-width: 19ch; }
+  .composer-wrap { position: sticky; bottom: 0; z-index: 3; padding: 10px 12px max(12px, env(safe-area-inset-bottom)); background: var(--bg); }
 }
 """
 
@@ -184,7 +260,9 @@ def _document(title: str, body: str, nonce: str, script: str = "") -> str:
   script_tag = f'<script nonce="{html.escape(nonce)}">{script}</script>' if script else ""
   return f"""<!doctype html><html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
-<meta name="color-scheme" content="dark"><title>{html.escape(title)}</title>
+<meta name="color-scheme" content="dark"><meta name="theme-color" content="#0d0d0d">
+<title>{html.escape(title)}</title>
+<link rel="preload" href="/assets/inter-400.woff2" as="font" type="font/woff2" crossorigin>
 <style nonce="{html.escape(nonce)}">{_STYLE}</style></head><body>{body}{script_tag}</body></html>"""
 
 
@@ -253,13 +331,13 @@ def recovery_page(
   )
   idle_minutes = max(1, idle_timeout_seconds // 60)
   body = f"""<main class="shell"><aside class="rail"><div class="brand">{_brand_mark()}
-<span>Möbius Recovery</span></div><div class="status-line"><span id="target-dot" class="{dot_class}"></span><span><strong>Secure remote access</strong><br>
+<span class="wordmark">Möbius</span><span class="brand-tag">Recovery</span></div><div class="status-line"><span id="target-dot" class="{dot_class}"></span><span><strong>Secure remote access</strong><br>
 <span id="target-status">{html.escape(target_text)}</span><br><button class="link-button" id="target-retry" type="button" hidden>Retry target check</button></span></div>
 <section class="session-life" id="session-life" aria-labelledby="session-life-title">
 <div class="session-life-head"><h2 id="session-life-title">Ends automatically</h2><span class="countdown" id="session-countdown">--:--</span></div>
 <p id="session-expiry-copy">After {idle_minutes} minutes without activity. Activity resets the timer; every session ends within one hour.</p>
 <button class="button secondary compact" id="keep-open" type="button">Keep open</button></section>
-<section><h2>AI provider</h2><div class="providers" id="providers">
+<section><h2 class="section-title">AI provider</h2><div class="providers" id="providers">
 <div class="provider"><label class="provider-name"><input type="radio" name="provider" value="claude" checked>Claude</label>
 <button class="link-button" data-connect="claude" type="button">Connect Claude</button></div>
 <div class="provider"><label class="provider-name"><input type="radio" name="provider" value="codex">Codex</label>
@@ -272,9 +350,11 @@ def recovery_page(
 <p class="lede">Describe what failed, what changed just before it, and what still works. The agent can inspect and repair only this Möbius container.</p>
 <div class="empty-note"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true"><path d="M12 3 4.5 6v5.5c0 4.5 3.1 7.6 7.5 9.5 4.4-1.9 7.5-5 7.5-9.5V6L12 3Z"/><path d="m9 12 2 2 4-4"/></svg><span>Möbius keeps running while you work. Commands use temporary root access through the fixed recovery relay.</span></div></div></div>
 <div class="composer-wrap"><form class="composer" id="composer"><label class="sr" for="message">Message recovery agent</label>
-<textarea id="message" maxlength="32000" placeholder="Describe the problem…" required></textarea><div class="composer-foot">
-<span class="hint">Enter to send · Shift+Enter for a new line</span><button class="button" id="send" type="submit">Send</button>
-</div></form></div></section></main>
+<textarea id="message" rows="1" maxlength="32000" placeholder="Describe the problem…" aria-describedby="composer-hint" required></textarea>
+<span class="sr" id="composer-hint">Enter to send, Shift+Enter for a new line</span>
+<button class="send" id="send" type="submit" aria-label="Send"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 19V5M5.5 11.5 12 5l6.5 6.5"/></svg><span class="spinner" aria-hidden="true"></span></button>
+</form></div></section></main>
+<template id="tool-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m5 8 4 4-4 4M12 17h7"/></svg></template>
 <dialog id="provider-dialog"><h2 id="dialog-title">Connect provider</h2><div id="dialog-body"></div>
 <div class="dialog-actions"><button class="button secondary" id="dialog-close" type="button">Close</button></div></dialog>
 <dialog id="finish-dialog"><h2>End Recovery?</h2><p class="lede">This stops any active recovery agent, closes temporary access, and removes the recovery worker. Möbius keeps running in place. If you leave instead, the session ends automatically after {idle_minutes} minutes without activity.</p>
@@ -327,7 +407,8 @@ function setBusy(value) {
   $('#finish').disabled = finishing;
   $('#finish-mobile').disabled = finishing;
   $('#keep-open').disabled = finishing;
-  $('#send').textContent = value ? 'Agent working…' : 'Send';
+  $('#send').classList.toggle('working', value);
+  $('#send').setAttribute('aria-label', value ? 'Agent working…' : 'Send');
   document.querySelectorAll('input[name=provider]').forEach(element => { element.disabled = disabled; });
   document.querySelectorAll('[data-connect]').forEach(element => {
     element.disabled = disabled || element.dataset.connected === 'true';
@@ -357,7 +438,7 @@ function addMessage(role, text, isError = false) {
   const element = document.createElement('div');
   element.className = `message ${role}${isError ? ' error-message' : ''}`;
   const label = document.createElement('span');
-  label.className = 'message-label';
+  label.className = 'message-label sr';
   label.textContent = role === 'user' ? 'YOU' : 'RECOVERY AGENT';
   const content = document.createElement('span');
   content.textContent = text;
@@ -369,13 +450,22 @@ function addMessage(role, text, isError = false) {
 
 function addTool(name, detail = '') {
   removeEmpty();
-  const element = document.createElement('div');
+  const element = document.createElement(detail ? 'details' : 'div');
   element.className = 'tool';
+  const summary = document.createElement(detail ? 'summary' : 'div');
+  summary.append($('#tool-icon').content.cloneNode(true));
   const label = document.createElement('span');
   label.className = 'tool-label';
-  label.textContent = `Möbius target · ${name || 'Tool'}`;
-  element.append(label);
+  label.textContent = /^(bash|command|exec|shell)$/i.test(name || '')
+    ? 'Ran a command on Möbius'
+    : `Used ${name || 'a tool'} on Möbius`;
+  summary.append(label);
+  element.append(summary);
   if (detail) {
+    const preview = document.createElement('span');
+    preview.className = 'tool-preview';
+    preview.textContent = detail.split('\n', 1)[0];
+    summary.append(preview);
     const command = document.createElement('pre');
     command.className = 'tool-detail';
     command.textContent = detail;
@@ -653,6 +743,14 @@ $('#dialog-close').onclick = () => {
   $('#provider-dialog').close();
 };
 
+function fitComposer() {
+  const input = $('#message');
+  input.style.height = 'auto';
+  input.style.height = `${Math.min(input.scrollHeight, 200)}px`;
+}
+
+$('#message').addEventListener('input', fitComposer);
+
 $('#message').addEventListener('keydown', event => {
   if (event.key === 'Enter' && !event.shiftKey) {
     event.preventDefault();
@@ -670,6 +768,7 @@ $('#composer').addEventListener('submit', async event => {
   setBusy(true);
   addMessage('user', text);
   input.value = '';
+  fitComposer();
   currentTurnStartedAt = Date.now();
   startAgentActivity(provider, 'Recovery agent is starting', currentTurnStartedAt);
   let assistantSegment;

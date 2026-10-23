@@ -15,13 +15,13 @@ from urllib.parse import parse_qs, urlparse
 
 import httpx
 from fastapi import FastAPI, Request
-from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
+from fastapi.responses import HTMLResponse, JSONResponse, Response, StreamingResponse
 
 from .broker import BROKER_SOCKET, CommandBroker
 from .chat import TurnCoordinator, stream_turn
 from .config import WORKER_PROTOCOL_VERSION, Settings
 from .control import ControlClient
-from .pages import closed_page, launch_page, lost_page, recovery_page
+from .pages import ASSETS, closed_page, launch_page, lost_page, recovery_page
 from .protocol import ProtocolError
 from .providers import ProviderAuth
 from .security import harden_process
@@ -151,6 +151,7 @@ def _security_headers(response, nonce: str | None = None):
     response.headers["Content-Security-Policy"] = (
       "default-src 'none'; base-uri 'none'; frame-ancestors 'none'; "
       f"style-src 'nonce-{nonce}'; script-src 'nonce-{nonce}'; "
+      "font-src 'self'; img-src 'self'; "
       "connect-src 'self'; form-action 'self'"
     )
   return response
@@ -346,6 +347,19 @@ def create_app(
       "protocol_version": WORKER_PROTOCOL_VERSION,
       "service_id": settings.service_id,
     }))
+
+  @app.get("/assets/{name}")
+  async def asset(name: str):
+    # A fixed, image-baked set of fonts and the brand mark. Each worker lives
+    # on its own short-lived domain, so the bytes can never change under a
+    # cached URL.
+    found = ASSETS.get(name)
+    if found is None:
+      raise ProtocolError("not_found", "Not found.", 404)
+    content, media_type = found
+    response = _security_headers(Response(content, media_type=media_type))
+    response.headers["Cache-Control"] = "public, max-age=86400, immutable"
+    return response
 
   @app.get("/", response_class=HTMLResponse)
   async def index(request: Request):
