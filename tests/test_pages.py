@@ -79,3 +79,40 @@ def test_end_recovery_remains_available_while_agent_is_working() -> None:
   assert "$('#finish-mobile').disabled = finishing" in _SCRIPT
   assert "disabled || !targetReady || !providerReady" in _SCRIPT
   assert "Wait for the active recovery turn" not in _SCRIPT
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="Node is unavailable")
+def test_activity_lines_read_like_the_shell() -> None:
+  start = _SCRIPT.index("const ACTIVITIES = new Map(")
+  end = _SCRIPT.index("function renderActivity()")
+  harness = _SCRIPT[start:end] + r"""
+const cases = [
+  [['Bash'], false, 'Ran a command'],
+  [['Bash', 'Bash', 'Read'], false, 'Ran commands, read a file'],
+  [['Skill'], false, 'Used a skill'],
+  [['Read', 'Grep'], true, 'Searching the code · Reading a file'],
+  [['mcp_custom'], false, 'mcp_custom'],
+];
+for (const [names, live, expected] of cases) {
+  const actual = activitySummary(names, live);
+  if (actual !== expected) throw new Error(`${names} ${live}: ${actual} !== ${expected}`);
+}
+"""
+  result = subprocess.run(
+    ["node", "-e", harness], text=True, capture_output=True, check=False,
+  )
+  assert result.returncode == 0, result.stderr
+
+
+def test_transcript_is_built_from_text_nodes() -> None:
+  assert "innerHTML" not in _SCRIPT
+  assert "renderMarkdown(content, next)" in _SCRIPT
+  now = datetime.now(timezone.utc)
+  page = recovery_page(
+    "nonce",
+    idle_expires_at=now + timedelta(minutes=20),
+    expires_at=now + timedelta(hours=1),
+    idle_timeout_seconds=20 * 60,
+  )
+  for kind in ("terminal", "files", "search", "edit", "web", "plan", "sparkle"):
+    assert f'<template id="icon-{kind}">' in page
