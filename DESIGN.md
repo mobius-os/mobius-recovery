@@ -26,6 +26,20 @@ are baked into the image and served from the worker's own origin (`/assets/`),
 so the page still makes no request to any other host. Body text is 15px; the
 wordmark is 20px semibold; headings stay at 28px or below.
 
+Font provenance: `recovery_worker/assets/inter-{400,500,600}.woff2` are the
+latin-subset files `files/inter-latin-{400,500,600}-normal.woff2` from the npm
+package `@fontsource/inter` 5.2.8, and
+`recovery_worker/assets/jetbrains-mono-400.woff2` is
+`files/jetbrains-mono-latin-400-normal.woff2` from `@fontsource/jetbrains-mono`
+5.3.0. All four are byte-identical to the shell's copies in
+`frontend/public/vendor/fonts/` of mobius-os/mobius (vendored there from
+`@fontsource` in f84439d09). Fontsource subsets and repackages the upstream
+projects: Inter by The Inter Project Authors (https://github.com/rsms/inter)
+and JetBrains Mono by The JetBrains Mono Project Authors
+(https://github.com/JetBrains/JetBrainsMono), both under the SIL Open Font
+License 1.1, reproduced in `recovery_worker/assets/LICENSE-Inter.txt` and
+`recovery_worker/assets/LICENSE-JetBrainsMono.txt`.
+
 ## Color tokens
 
 The shell's default dark theme:
@@ -50,8 +64,19 @@ The transcript reads like a Möbius chat. Consecutive tool calls collapse into o
 activity line worded exactly as the shell words it ("Running a command ·
 Reading files" while live, "Ran commands, read a file" once settled), with the
 shell's type glyph, and expand to a quiet timeline of raw tool names and what
-they ran. Assistant replies render the Markdown subset agents write
-(paragraphs, headings, lists, code, bold), built from text nodes only.
+they ran.
+
+Assistant replies render a fixed Markdown subset, built from DOM and text
+nodes only (no HTML parsing): paragraphs, `#` headings, `-`/`*`/`+` and
+numbered lists, fenced code, `>` block quotes, pipe tables (a header row
+followed by a `|---|` delimiter row with the same number of cells), `---`
+rules, and inline `code`, **bold**, *italic*/_italic_ and `[text](url)`
+links. A link becomes an anchor only when its target is an absolute `http:` or
+`https:` URL; it opens in a new tab with `rel="noopener noreferrer"`. Anything
+outside the subset, including links with any other target, stays as the raw
+text the agent wrote with its line breaks preserved, so unsupported syntax
+degrades to its readable source rather than merging into one line. Streamed
+text is re-rendered at most once per animation frame.
 
 Finish freezes the incident workspace immediately. A managed live target is
 shown as closed only after its signed session revocation is confirmed; failure

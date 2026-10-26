@@ -181,7 +181,8 @@ label { display: block; margin-bottom: 8px; font-size: 13px; font-weight: 500; }
   box-shadow: 0 2px 14px -4px var(--accent-dim);
 }
 .message.error-message { padding: 0 8px; color: #fecaca; }
-.md { white-space: normal; }
+/* Assistant prose keeps the message's pre-wrap, so a line break the agent
+   wrote stays a line break even where the Markdown subset does not apply. */
 .md > * { margin: 0 0 .75rem; padding: 0 8px; }
 .md > :last-child { margin-bottom: 0; }
 .md-heading { font-weight: 600; }
@@ -189,6 +190,17 @@ label { display: block; margin-bottom: 8px; font-size: 13px; font-weight: 500; }
 .md-list li + li { margin-top: 4px; }
 .md-inline-code { padding: 1px 5px; border-radius: 5px; background: var(--surface-2); font: .87em var(--mono); }
 .md-code-block { margin-inline: 8px; padding: 10px 12px; overflow: auto; border: 1px solid var(--border-light); border-radius: 10px; background: var(--surface); font: 13px/1.55 var(--mono); white-space: pre; }
+.md-link { color: color-mix(in srgb, var(--accent) 70%, var(--text)); text-decoration: underline; text-underline-offset: 2px; }
+.md-link:hover { color: var(--text); }
+.md-quote { margin-inline: 8px; padding: 0 0 0 12px; border-left: 3px solid var(--border); color: var(--muted); }
+.md-quote > * { margin: 0 0 .5rem; padding: 0; }
+.md-quote > :last-child { margin-bottom: 0; }
+.md-quote > .md-list { padding-left: 22px; }
+.md-rule { height: 0; margin-inline: 8px; border: 0; border-top: 1px solid var(--border); }
+.md-table-wrap { margin-inline: 8px; padding: 0; overflow-x: auto; }
+.md-table { border-collapse: collapse; font-size: 14px; line-height: 1.5; }
+.md-table th, .md-table td { padding: 6px 12px; border: 1px solid var(--border); text-align: left; vertical-align: top; }
+.md-table th { background: var(--surface); font-weight: 600; }
 /* The shell's activity line: muted 13px prose, a 14px type glyph, a shimmer
    while live, and a quiet timeline of raw steps when expanded. */
 .activity, .agent-activity { margin: 0 0 8px; padding-left: 6px; }
@@ -444,12 +456,35 @@ function removeEmpty() {
   empty = null;
 }
 
-// Assistant prose renders the small Markdown subset agents actually write
-// (paragraphs, headings, lists, code, bold), built from text nodes only.
-const LIST_ITEM = /^\s*([-*+]|\d+[.)])\s+/;
+// Assistant prose renders a small, fixed Markdown subset, built from DOM nodes
+// and text nodes only, never parsed HTML:
+//   blocks: paragraphs, # headings, -/*/+ and 1. lists, ``` fences, > quotes,
+//           pipe tables (header row + |---| delimiter row), --- rules
+//   inline: `code`, **bold**/__bold__, *italic*/_italic_, [text](url)
+// Anything else stays as the raw text the agent wrote, with its line breaks
+// kept (paragraph lines join with \n under white-space: pre-wrap), so unknown
+// syntax degrades to something readable rather than one merged line. A link
+// becomes an anchor only for an absolute http(s) URL, opened in a new tab with
+// rel="noopener noreferrer"; any other target shows as its raw Markdown text.
+const LIST_ITEM = /^(\s*)([-*+]|\d+[.)])\s+/;
 const FENCE = /^\s*```/;
 const HEADING = /^#{1,6}\s+/;
+const QUOTE = /^\s*>/;
+const RULE = /^\s*([-*_])(\s*\1){2,}\s*$/;
+const TABLE_DELIMITER = /^\s*\|?\s*:?-+:?\s*(\|\s*:?-+:?\s*)*\|?\s*$/;
+// Order matters: code wins over emphasis, bold over italic. A lone `*` or `_`
+// between spaces, and snake_case words, are not emphasis.
+const INLINE = new RegExp([
+  /`[^`\n]+`/,
+  /\*\*(?:[^*\n]|\*(?!\*))+?\*\*/,
+  /__[^_\n]+__/,
+  /\[[^\]\n]+\]\([^()\s]+\)/,
+  /\*(?![\s*])[^*\n]+?(?<!\s)\*/,
+  /(?<!\w)_(?![\s_])[^_\n]+?(?<!\s)_(?!\w)/,
+].map(part => part.source).join('|'));
 const rawText = new WeakMap();
+const pendingRenders = new Set();
+let renderFrame = 0;
 
 function make(tag, className) {
   const element = document.createElement(tag);
@@ -457,24 +492,102 @@ function make(tag, className) {
   return element;
 }
 
+function safeHref(value) {
+  try {
+    const url = new URL(value);
+    return url.protocol === 'http:' || url.protocol === 'https:' ? url.href : null;
+  } catch {
+    return null;
+  }
+}
+
 function renderInline(target, text) {
-  const pattern = /`[^`\n]+`|\*\*[^*\n]+\*\*|__[^_\n]+__/g;
+  const pattern = new RegExp(INLINE.source, 'g'); // fresh lastIndex per (nested) call
   let last = 0;
   let match;
   while ((match = pattern.exec(text))) {
     if (match.index > last) target.append(text.slice(last, match.index));
     const token = match[0];
-    const element = token[0] === '`' ? make('code', 'md-inline-code') : make('strong');
-    element.textContent = token[0] === '`' ? token.slice(1, -1) : token.slice(2, -2);
-    target.append(element);
     last = pattern.lastIndex;
+    if (token[0] === '`') {
+      const code = make('code', 'md-inline-code');
+      code.textContent = token.slice(1, -1);
+      target.append(code);
+    } else if (token[0] === '[') {
+      const split = token.indexOf('](');
+      const href = safeHref(token.slice(split + 2, -1));
+      if (!href) {
+        target.append(token);
+        continue;
+      }
+      const link = make('a', 'md-link');
+      link.href = href;
+      link.target = '_blank';
+      link.rel = 'noopener noreferrer';
+      link.textContent = token.slice(1, split);
+      target.append(link);
+    } else {
+      const strong = token.startsWith('**') || token.startsWith('__');
+      const element = make(strong ? 'strong' : 'em');
+      renderInline(element, strong ? token.slice(2, -2) : token.slice(1, -1));
+      target.append(element);
+    }
   }
   if (last < text.length) target.append(text.slice(last));
 }
 
-function renderMarkdown(target, text) {
-  target.replaceChildren();
-  const lines = text.split('\n');
+function tableCells(line) {
+  let row = line.trim();
+  if (row.startsWith('|')) row = row.slice(1);
+  if (row.endsWith('|') && !row.endsWith('\\|')) row = row.slice(0, -1);
+  return row.split(/(?<!\\)\|/).map(cell => cell.trim().replaceAll('\\|', '|'));
+}
+
+function isTableStart(lines, index) {
+  const header = lines[index];
+  const delimiter = lines[index + 1];
+  return header?.includes('|') && delimiter?.includes('|')
+    && TABLE_DELIMITER.test(delimiter)
+    && tableCells(header).length === tableCells(delimiter).length;
+}
+
+function startsBlock(lines, index) {
+  const line = lines[index];
+  return FENCE.test(line) || HEADING.test(line) || QUOTE.test(line)
+    || RULE.test(line) || LIST_ITEM.test(line) || isTableStart(lines, index);
+}
+
+function renderTable(target, lines, index) {
+  const alignments = tableCells(lines[index + 1]).map(cell => (
+    cell.startsWith(':') && cell.endsWith(':') ? 'center'
+      : cell.endsWith(':') ? 'right' : cell.startsWith(':') ? 'left' : ''
+  ));
+  const row = (cells, tag) => {
+    const element = make('tr');
+    alignments.forEach((align, column) => {
+      const cell = make(tag);
+      if (align) cell.style.textAlign = align;
+      renderInline(cell, cells[column] || '');
+      element.append(cell);
+    });
+    return element;
+  };
+  const head = make('thead');
+  head.append(row(tableCells(lines[index]), 'th'));
+  const body = make('tbody');
+  index += 2;
+  while (index < lines.length && lines[index].includes('|') && lines[index].trim()) {
+    body.append(row(tableCells(lines[index++]), 'td'));
+  }
+  const table = make('table', 'md-table');
+  table.append(head, body);
+  const wrap = make('div', 'md-table-wrap');
+  wrap.append(table);
+  target.append(wrap);
+  return index;
+}
+
+function renderBlocks(target, lines) {
   let index = 0;
   while (index < lines.length) {
     const line = lines[index];
@@ -490,35 +603,79 @@ function renderMarkdown(target, text) {
       index += 1;
     } else if (HEADING.test(line)) {
       const heading = make('p', 'md-heading');
-      renderInline(heading, line.replace(HEADING, ''));
+      renderInline(heading, line.replace(HEADING, '').trim());
       target.append(heading);
       index += 1;
+    } else if (QUOTE.test(line)) {
+      const quoted = [];
+      while (index < lines.length && QUOTE.test(lines[index])) {
+        quoted.push(lines[index++].replace(/^\s*> ?/, ''));
+      }
+      const quote = make('blockquote', 'md-quote');
+      renderBlocks(quote, quoted);
+      target.append(quote);
+    } else if (isTableStart(lines, index)) {
+      index = renderTable(target, lines, index);
+    } else if (RULE.test(line)) {
+      target.append(make('hr', 'md-rule'));
+      index += 1;
     } else if (LIST_ITEM.test(line)) {
-      const list = make(/^\s*\d/.test(line) ? 'ol' : 'ul', 'md-list');
-      while (index < lines.length && LIST_ITEM.test(lines[index])) {
-        const item = make('li');
-        renderInline(item, lines[index++].replace(LIST_ITEM, ''));
-        list.append(item);
+      const ordered = /^\s*\d/.test(line);
+      const list = make(ordered ? 'ol' : 'ul', 'md-list');
+      if (ordered) list.start = parseInt(line, 10) || 1;
+      let item = null;
+      while (index < lines.length) {
+        const current = lines[index];
+        const marker = LIST_ITEM.exec(current);
+        if (marker) {
+          item = make('li');
+          const depth = Math.min(Math.floor(marker[1].replace(/\t/g, '  ').length / 2), 4);
+          if (depth) item.style.marginLeft = `${depth * 1.25}em`;
+          renderInline(item, current.slice(marker[0].length));
+          list.append(item);
+        } else if (/^\s+\S/.test(current) && !startsBlock(lines, index)) {
+          renderInline(item, `\n${current.trim()}`);
+        } else {
+          break;
+        }
+        index += 1;
       }
       target.append(list);
     } else {
-      const paragraph = [];
-      while (
-        index < lines.length && lines[index].trim() && !FENCE.test(lines[index])
-        && !HEADING.test(lines[index]) && !LIST_ITEM.test(lines[index])
-      ) paragraph.push(lines[index++].trim());
+      const paragraph = [line.trim()];
+      index += 1;
+      while (index < lines.length && lines[index].trim() && !startsBlock(lines, index)) {
+        paragraph.push(lines[index++].trim());
+      }
       const element = make('p', 'md-paragraph');
-      renderInline(element, paragraph.join(' '));
+      renderInline(element, paragraph.join('\n'));
       target.append(element);
     }
   }
 }
 
+function renderMarkdown(target, text) {
+  target.replaceChildren();
+  renderBlocks(target, text.split('\n'));
+}
+
+// Streamed deltas only accumulate; the DOM is rebuilt and scrolled at most
+// once per animation frame however many deltas arrive in between.
+function flushAssistant() {
+  renderFrame = 0;
+  let last = null;
+  for (const content of pendingRenders) {
+    renderMarkdown(content, rawText.get(content) || '');
+    if (content.isConnected) last = content;
+  }
+  pendingRenders.clear();
+  last?.parentElement.scrollIntoView({ block: 'end' });
+}
+
 function appendAssistant(content, text) {
-  const next = (rawText.get(content) || '') + text;
-  rawText.set(content, next);
-  renderMarkdown(content, next);
-  content.parentElement.scrollIntoView({ block: 'end' });
+  rawText.set(content, (rawText.get(content) || '') + text);
+  pendingRenders.add(content);
+  if (!renderFrame) renderFrame = requestAnimationFrame(flushAssistant);
 }
 
 function addMessage(role, text, isError = false) {
@@ -540,6 +697,17 @@ function addMessage(role, text, isError = false) {
 // Consecutive tool calls form one activity line, worded exactly like the
 // shell's: live "Running a command · Reading files", settled "Read files, ran
 // commands". Expanding it lists each raw tool name with what it ran.
+//
+// Hand copy of the Möbius shell (mobius-os/mobius, origin/main 4beffc080), so
+// re-check these files when the shell's wording changes:
+//   ACTIVITIES, SINGULAR  <- frontend/src/components/ChatView/toolActivityLabel.js
+//                            (ACTIVITY_LABELS, PAST_LABELS, *_SINGULAR,
+//                            ACTIVITY_ICONS; last changed in 3216f97fe)
+//   activitySummary       <- frontend/src/components/ChatView/groupBlocks.js
+//                            (toolGroupSummary live, toolGroupPastSummary
+//                            settled; last changed in 63cba455e)
+// Only the tools a recovery agent can call are copied; 'Command' is
+// Recovery's own broker tool and reads like the shell's Bash.
 const ACTIVITIES = new Map([
   ['Read', ['Reading files', 'Read files', 'files']],
   ['Glob', ['Reading files', 'Read files', 'files']],
