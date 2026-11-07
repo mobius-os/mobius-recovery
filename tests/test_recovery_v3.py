@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+import re
 import stat
 from datetime import datetime, timedelta, timezone
 
@@ -16,6 +17,7 @@ from recovery_worker.chat import TurnCoordinator
 from recovery_worker.app import create_app
 from recovery_worker.config import Settings, WORKER_PROTOCOL_VERSION
 from recovery_worker.control import ControlClient, ExchangeResult
+from recovery_worker.pages import ASSETS
 from recovery_worker.protocol import ProtocolError
 from recovery_worker.sessions import COOKIE_NAME, SessionStore
 
@@ -439,3 +441,31 @@ def test_unexpected_post_exchange_failure_keeps_an_authenticated_page(
   assert COOKIE_NAME in started.cookies
   assert "could not prepare the target connection" in started.text
   assert "internal detail" not in started.text
+
+
+def test_brand_assets_are_a_fixed_same_origin_set(monkeypatch, tmp_path) -> None:
+  monkeypatch.setattr(app_module, "harden_process", lambda: None)
+  app = create_app(
+    settings(),
+    control_transport=httpx.MockTransport(lambda request: httpx.Response(404)),
+    broker_path=tmp_path / "broker" / "command.sock",
+    workspace_root=tmp_path / "workspaces",
+  )
+  with TestClient(app, base_url="https://worker.example") as client:
+    page = client.get("/")
+    policy = page.headers["Content-Security-Policy"]
+    assert "default-src 'none'" in policy
+    assert "font-src 'self'; img-src 'self'" in policy
+    referenced = set(re.findall(r"""(?:url\(|src=|href=)['"](/assets/[^'"]+)['"]""", page.text))
+    assert referenced and referenced <= {f"/assets/{name}" for name in ASSETS}
+    assert "https://" not in page.text.replace(ORIGIN, "")
+
+    for name, (content, media_type) in ASSETS.items():
+      served = client.get(f"/assets/{name}")
+      assert served.status_code == 200
+      assert served.headers["content-type"].startswith(media_type)
+      assert served.headers["X-Content-Type-Options"] == "nosniff"
+      assert served.content == content
+
+    for name in ("app.py", "LICENSE-Inter.txt", "..%2Fapp.py"):
+      assert client.get(f"/assets/{name}").status_code == 404
